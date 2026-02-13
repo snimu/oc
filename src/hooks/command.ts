@@ -2,17 +2,6 @@ import { readdir, readFile, stat } from "fs/promises";
 import type { SessionState } from "../types";
 import { getActiveSegment, getRecentSummaries } from "../trajectory/manager";
 
-// ── Box drawing ──────────────────────────────────────────────────────
-const V = "│";
-const H = "─";
-const RULE_W = 72;
-
-function hRule(left: string, label?: string): string {
-  if (!label) return `  ${left}${H.repeat(RULE_W)}`;
-  const tail = RULE_W - label.length - 1;
-  return `  ${left} ${label} ${H.repeat(Math.max(0, tail))}`;
-}
-
 function fmt(n: number): string {
   if (n >= 100_000) return `${(n / 1000).toFixed(0)}k`;
   if (n >= 1_000) return `${(n / 1000).toFixed(1)}k`;
@@ -22,10 +11,6 @@ function fmt(n: number): string {
 function pct(n: number, total: number): string {
   if (total === 0) return "0%";
   return `${((n / total) * 100).toFixed(1)}%`;
-}
-
-function padR(s: string, len: number): string {
-  return s.length >= len ? s : s + " ".repeat(len - s.length);
 }
 
 function timeAgo(iso: string): string {
@@ -48,15 +33,25 @@ async function peekVar(path: string): Promise<string> {
       typeof parsed.value === "string"
         ? parsed.value
         : JSON.stringify(parsed.value);
-    return val.length > 56 ? val.slice(0, 56) + "…" : val;
+    return val.length > 50 ? val.slice(0, 50) + "..." : val;
   } catch {
     try {
       const raw = await readFile(path, "utf-8");
-      return raw.length > 56 ? raw.slice(0, 56) + "…" : raw;
+      return raw.length > 50 ? raw.slice(0, 50) + "..." : raw;
     } catch {
       return "(unreadable)";
     }
   }
+}
+
+const INDENT = "  ";
+
+/** Indent every line of text, including lines created by embedded newlines. */
+function indent(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => INDENT + line)
+    .join("\n");
 }
 
 export interface ContextDisplayOpts {
@@ -64,9 +59,6 @@ export interface ContextDisplayOpts {
   contextLimit?: number;
 }
 
-/**
- * Build the RLM context display for the /context command.
- */
 export async function buildContextDisplay(
   state: SessionState,
   opts: ContextDisplayOpts = {},
@@ -81,7 +73,6 @@ export async function buildContextDisplay(
   const totalProcessed = doc.stats.totalTokensProcessed;
   const compactions = doc.stats.totalCompactions;
 
-  // Gather vars/ info
   const varsEntries: Array<{ name: string; size: number; path: string }> = [];
   try {
     const files = await readdir(state.varsDir);
@@ -96,81 +87,65 @@ export async function buildContextDisplay(
 
   const L: string[] = [];
 
-  // ── Header ──────────────────────────────────────────────────────────
-  L.push(hRule("┌", "RLM Context"));
-  L.push(`  ${V}`);
+  L.push("RLM Context");
+  L.push("----------------------------------------");
+  L.push("");
 
-  // ── Root Model Context ──────────────────────────────────────────────
-  L.push(`  ${V}  ROOT MODEL CONTEXT`);
-  L.push(`  ${V}  What the language model currently sees`);
-  L.push(`  ${V}`);
-
+  L.push("Root Model Context");
   if (opts.modelInputTokens != null) {
-    let line = `  ${V}    ${fmt(opts.modelInputTokens)} input tokens`;
+    let line = `${fmt(opts.modelInputTokens)} input tokens`;
     if (opts.contextLimit) {
-      line += `  /  ${fmt(opts.contextLimit)} limit  (${pct(opts.modelInputTokens, opts.contextLimit)})`;
+      line += ` / ${fmt(opts.contextLimit)} limit (${pct(opts.modelInputTokens, opts.contextLimit)})`;
     }
-    L.push(line);
+    L.push(indent(line));
   } else {
-    L.push(`  ${V}    ~${fmt(activeTokens)} tokens (estimated)`);
+    L.push(indent(`~${fmt(activeTokens)} tokens (estimated)`));
   }
-  L.push(`  ${V}    ${activeTurns} turns`);
+  let turnsLine = `${fmt(activeTurns)} turns`;
   if (active?.startedAt) {
-    L.push(`  ${V}    started ${timeAgo(active.startedAt)}`);
+    turnsLine += `, started ${timeAgo(active.startedAt)}`;
   }
-  L.push(`  ${V}`);
+  L.push(indent(turnsLine));
+  L.push("");
 
-  // ── Total RLM Context ───────────────────────────────────────────────
-  L.push(hRule("├", "Total RLM Context"));
-  L.push(`  ${V}  Full trajectory including compacted history`);
-  L.push(`  ${V}`);
-  L.push(`  ${V}    ${fmt(totalProcessed)} tokens total  ·  ${doc.stats.totalTurns} turns`);
+  L.push("Total RLM Context");
+  L.push(indent(`${fmt(totalProcessed)} tokens total, ${doc.stats.totalTurns} turns`));
   if (compactions > 0) {
-    L.push(`  ${V}    ${fmt(compactedTokens)} compacted  (${pct(compactedTokens, totalProcessed || 1)})  ·  ${compactions} compaction${compactions === 1 ? "" : "s"}`);
-    L.push(`  ${V}    ${fmt(activeTokens)} active  (${pct(activeTokens, totalProcessed || 1)})`);
+    L.push(indent(`${fmt(compactedTokens)} compacted (${pct(compactedTokens, totalProcessed || 1)}), ${compactions} compaction${compactions === 1 ? "" : "s"}`));
+    L.push(indent(`${fmt(activeTokens)} active (${pct(activeTokens, totalProcessed || 1)})`));
   }
-  L.push(`  ${V}`);
+  L.push("");
 
-  // ── Compaction summaries ────────────────────────────────────────────
   if (summaries.length > 0) {
-    L.push(hRule("├", "Compaction History"));
-    L.push(`  ${V}`);
+    L.push("Compaction History");
     for (const s of summaries) {
       const preview =
-        s.summary.length > 68
-          ? s.summary.slice(0, 68).trimEnd() + "…"
+        s.summary.length > 60
+          ? s.summary.slice(0, 60).trimEnd() + "..."
           : s.summary;
-      const oneLine = preview.replace(/\n/g, " ");
-      const age = timeAgo(s.compactedAt);
-      L.push(`  ${V}  #${s.segmentIndex}  ${padR(age, 8)}  ${oneLine}`);
+      L.push(indent(`#${s.segmentIndex} ${timeAgo(s.compactedAt)} - ${preview}`));
     }
-    L.push(`  ${V}`);
+    L.push("");
   }
 
-  // ── Variables ───────────────────────────────────────────────────────
-  L.push(hRule("├", "REPL Variables"));
-  L.push(`  ${V}`);
+  L.push("REPL Variables");
   if (varsEntries.length === 0) {
-    L.push(`  ${V}  (empty)`);
+    L.push(indent("(empty)"));
   } else {
     for (const v of varsEntries.slice(0, 6)) {
       const preview = await peekVar(v.path);
-      L.push(`  ${V}  ${padR(v.name, 18)} ${preview}`);
+      L.push(indent(`${v.name}: ${preview}`));
     }
     if (varsEntries.length > 6) {
-      L.push(`  ${V}  … and ${varsEntries.length - 6} more`);
+      L.push(indent(`... and ${varsEntries.length - 6} more`));
     }
   }
-  L.push(`  ${V}`);
+  L.push("");
 
-  // ── Paths ───────────────────────────────────────────────────────────
-  L.push(hRule("├", "Paths"));
-  L.push(`  ${V}`);
-  L.push(`  ${V}  session      ${state.sessionDir}`);
-  L.push(`  ${V}  rlm context  ${state.trajectoryPath}`);
-  L.push(`  ${V}  repl vars    ${state.varsDir}`);
-  L.push(`  ${V}`);
-  L.push(hRule("└"));
+  L.push("Paths");
+  L.push(indent(`session: ${state.sessionDir}`));
+  L.push(indent(`full context: ${state.trajectoryPath}`));
+  L.push(indent(`repl vars: ${state.varsDir}`));
 
   return L.join("\n");
 }

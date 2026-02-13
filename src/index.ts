@@ -30,7 +30,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
     config: async (cfg: any) => {
       if (!cfg.command) cfg.command = {};
       cfg.command.context = {
-        template: "Show the current RLM trajectory context status",
+        template: "Display the RLM context status below",
         description: "Show RLM context and trajectory status",
       };
     },
@@ -140,7 +140,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
       }
     },
 
-    "command.execute.before": async (input, _output) => {
+    "command.execute.before": async (input, output) => {
       if (input.command === "context") {
         const state = sessionStates.get(input.sessionID);
         if (!state) return;
@@ -185,6 +185,8 @@ export const RLMPlugin: Plugin = async (ctx) => {
           modelInputTokens,
           contextLimit,
         });
+
+        // Display directly as a message, no LLM call.
         await ctx.client.session.prompt({
           path: { id: input.sessionID },
           body: {
@@ -192,7 +194,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
             parts: [{ type: "text", text: display }],
           },
         });
-        throw new Error("__handled__");
+        throw new Error("__rlm_context_handled__");
       }
     },
 
