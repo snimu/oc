@@ -2,7 +2,10 @@
   "name": "opencode-rlm",
   "version": "0.1.0",
   "description": "Recursive Language Model plugin for OpenCode with trajectory management",
-  "exports": "./src/index.ts",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "type": "module",
   "dependencies": {
     "@opencode-ai/plugin": "latest"

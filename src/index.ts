@@ -6,6 +6,7 @@ import { handleSessionCreated } from "./hooks/session-created";
 import { handleSessionIdle } from "./hooks/session-idle";
 import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
+import { buildContextDisplay } from "./hooks/command";
 import {
   recordCompaction,
   enqueueWrite,
@@ -26,6 +27,14 @@ export const RLMPlugin: Plugin = async (ctx) => {
   });
 
   return {
+    config: async (cfg: any) => {
+      if (!cfg.command) cfg.command = {};
+      cfg.command.context = {
+        template: "Show the current RLM trajectory context status",
+        description: "Show RLM context and trajectory status",
+      };
+    },
+
     tool: {
       rlm_read_trajectory: createReadTrajectoryTool(sessionStates),
       rlm_search_trajectory: createSearchTrajectoryTool(sessionStates),
@@ -128,6 +137,22 @@ export const RLMPlugin: Plugin = async (ctx) => {
             extra: { stack: error.stack },
           },
         });
+      }
+    },
+
+    "command.execute.before": async (input, _output) => {
+      if (input.command === "context") {
+        const state = sessionStates.get(input.sessionID);
+        if (!state) return;
+        const display = await buildContextDisplay(state);
+        await ctx.client.session.prompt({
+          path: { id: input.sessionID },
+          body: {
+            noReply: true,
+            parts: [{ type: "text", text: display }],
+          },
+        });
+        throw new Error("__handled__");
       }
     },
 

@@ -31,38 +31,44 @@ cd opencode-rlm
 bun install
 ```
 
-Then wire it into OpenCode using one of these methods:
+Then register it in `opencode.json` (project root) or `~/.config/opencode/opencode.json` (global):
 
-### Option A: Project-level plugin
-
-In the project directory where you run OpenCode:
-
-```bash
-mkdir -p .opencode
-```
-
-Add to `.opencode/config.json`:
-
-```json
+```jsonc
+// opencode.json
 {
-  "plugin": ["/absolute/path/to/opencode-rlm"]
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file:///absolute/path/to/opencode-rlm"]
 }
 ```
 
-### Option B: Global plugin (all projects)
-
-Symlink into the global plugins directory:
-
-```bash
-mkdir -p ~/.config/opencode/plugins
-ln -s /absolute/path/to/opencode-rlm ~/.config/opencode/plugins/opencode-rlm
-```
+Alternatively, place the plugin directory in `.opencode/plugins/` (project) or `~/.config/opencode/plugins/` (global).
 
 ## Verify it works
 
 1. Run `opencode` in a project directory
 2. Check logs for `RLM plugin loaded`
 3. After a message exchange, look for a `/tmp/rlm-opencode-*` directory containing `active/trajectory.json`
+4. Run `/context` — you'll see the standard OpenCode context info plus an appended **RLM Context** section:
+
+```
+ Context Usage
+ ⛁ ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶   claude-opus-4-6 · 52k/200k tokens (26%)
+ ...
+
+RLM Context
+  ⛁ ⛁ ⛁ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶ ⛶  active segment 0 · 12.3k tokens (24 turns)
+
+  Trajectory
+    ⛁ Active:    12.3k tokens, 24 turns (100%)
+    Total: 12.3k tokens, 24 turns
+
+  Vars
+    (empty)
+
+  Session:    /tmp/rlm-opencode-8e13a
+  Trajectory: /tmp/rlm-opencode-8e13a/active/trajectory.json
+  Vars:       /tmp/rlm-opencode-8e13a/vars
+```
 
 ## Configuration
 
