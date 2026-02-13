@@ -4,10 +4,12 @@
 
 ## What it does
 
-- **Trajectory logging** — appends every turn to `active/trajectory.json` so nothing is lost on compaction
-- **Compaction-aware summaries** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
+- **Tracks full RLM history without discarding information** — appends every turn to `active/trajectory.json` so nothing is lost on compaction
+- **Summarizes when root LM is full, but history still available in JSON** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
 - **System prompt for recursion** — tells the LM about its trajectory file, vars directory, and `opencode run` for spawning subtasks
+
+Also provide a `/context` command for the user to view the current active history (on disk) + the LM's current context. Looks something like this:
 
 ## Installation
 
