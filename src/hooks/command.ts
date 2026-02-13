@@ -5,45 +5,12 @@ import { getActiveSegment, getRecentSummaries } from "../trajectory/manager";
 // ── Box drawing ──────────────────────────────────────────────────────
 const V = "│";
 const H = "─";
-
-// ── Layout constants ─────────────────────────────────────────────────
-const BAR_WIDTH = 44;
 const RULE_W = 72;
 
 function hRule(left: string, label?: string): string {
   if (!label) return `  ${left}${H.repeat(RULE_W)}`;
   const tail = RULE_W - label.length - 1;
   return `  ${left} ${label} ${H.repeat(Math.max(0, tail))}`;
-}
-
-/**
- * Simple block bar: █ for filled, ░ for empty.
- */
-function bar(ratio: number, fill = "█", width = BAR_WIDTH): string {
-  const clamped = Math.max(0, Math.min(ratio, 1));
-  const filled = Math.round(clamped * width);
-  const empty = width - filled;
-  return fill.repeat(filled) + "░".repeat(empty);
-}
-
-/**
- * Stacked bar: two segments drawn with different fill characters.
- */
-function stackedBar(
-  ratioA: number,
-  ratioB: number,
-  width = BAR_WIDTH,
-): string {
-  const a = Math.max(0, Math.min(ratioA, 1));
-  const b = Math.max(0, Math.min(ratioB, 1 - a));
-  const cellsA = Math.round(a * width);
-  const cellsB = Math.round(b * width);
-  const cellsEmpty = width - cellsA - cellsB;
-  return (
-    "▓".repeat(cellsA) +
-    "█".repeat(cellsB) +
-    "░".repeat(Math.max(0, cellsEmpty))
-  );
 }
 
 function fmt(n: number): string {
@@ -92,11 +59,17 @@ async function peekVar(path: string): Promise<string> {
   }
 }
 
+export interface ContextDisplayOpts {
+  modelInputTokens?: number;
+  contextLimit?: number;
+}
+
 /**
  * Build the RLM context display for the /context command.
  */
 export async function buildContextDisplay(
   state: SessionState,
+  opts: ContextDisplayOpts = {},
 ): Promise<string> {
   const doc = state.document;
   const active = getActiveSegment(doc);
@@ -104,9 +77,8 @@ export async function buildContextDisplay(
 
   const activeTurns = active?.turns.length ?? 0;
   const activeTokens = active?.totalEstimatedTokens ?? 0;
-  const segIdx = active?.segmentIndex ?? 0;
   const compactedTokens = doc.stats.totalTokensProcessed - activeTokens;
-  const totalProcessed = doc.stats.totalTokensProcessed || 1;
+  const totalProcessed = doc.stats.totalTokensProcessed;
   const compactions = doc.stats.totalCompactions;
 
   // Gather vars/ info
@@ -129,41 +101,35 @@ export async function buildContextDisplay(
   L.push(`  ${V}`);
 
   // ── Root Model Context ──────────────────────────────────────────────
-  const rootStats = `${fmt(activeTokens)} tokens · ${activeTurns} turns`;
-  L.push(`  ${V}  ROOT MODEL CONTEXT                          ${rootStats}`);
+  L.push(`  ${V}  ROOT MODEL CONTEXT`);
   L.push(`  ${V}  What the language model currently sees`);
   L.push(`  ${V}`);
 
-  const aRatio = totalProcessed > 0 ? activeTokens / totalProcessed : 1;
-  const aBar = bar(aRatio);
-  const started =
-    active?.startedAt ? `started ${timeAgo(active.startedAt)}` : "";
-  L.push(`  ${V}  ${aBar}  seg ${segIdx} · ${started}`);
-  if (compactions > 0) {
-    L.push(
-      `  ${V}  ${" ".repeat(BAR_WIDTH)}  ${pct(activeTokens, totalProcessed)} of total trajectory`,
-    );
+  if (opts.modelInputTokens != null) {
+    let line = `  ${V}    ${fmt(opts.modelInputTokens)} input tokens`;
+    if (opts.contextLimit) {
+      line += `  /  ${fmt(opts.contextLimit)} limit  (${pct(opts.modelInputTokens, opts.contextLimit)})`;
+    }
+    L.push(line);
+  } else {
+    L.push(`  ${V}    ~${fmt(activeTokens)} tokens (estimated)`);
+  }
+  L.push(`  ${V}    ${activeTurns} turns`);
+  if (active?.startedAt) {
+    L.push(`  ${V}    started ${timeAgo(active.startedAt)}`);
   }
   L.push(`  ${V}`);
 
   // ── Total RLM Context ───────────────────────────────────────────────
+  L.push(hRule("├", "Total RLM Context"));
+  L.push(`  ${V}  Full trajectory including compacted history`);
+  L.push(`  ${V}`);
+  L.push(`  ${V}    ${fmt(totalProcessed)} tokens total  ·  ${doc.stats.totalTurns} turns`);
   if (compactions > 0) {
-    L.push(hRule("├", "Total RLM Context"));
-    L.push(`  ${V}  Full trajectory including compacted history`);
-    L.push(`  ${V}`);
-
-    const totalLabel = `${fmt(totalProcessed)} tokens · ${doc.stats.totalTurns} turns · ${compactions} compaction${compactions === 1 ? "" : "s"}`;
-    L.push(`  ${V}  ${totalLabel}`);
-    L.push(`  ${V}`);
-
-    const cRatio = compactedTokens / totalProcessed;
-    const sBar = stackedBar(cRatio, aRatio);
-    L.push(`  ${V}  ${sBar}`);
-    L.push(
-      `  ${V}  ${padR(`▓ compacted  ${fmt(compactedTokens)}  ${pct(compactedTokens, totalProcessed)}`, BAR_WIDTH)}  █ active  ${fmt(activeTokens)}  ${pct(activeTokens, totalProcessed)}`,
-    );
-    L.push(`  ${V}`);
+    L.push(`  ${V}    ${fmt(compactedTokens)} compacted  (${pct(compactedTokens, totalProcessed || 1)})  ·  ${compactions} compaction${compactions === 1 ? "" : "s"}`);
+    L.push(`  ${V}    ${fmt(activeTokens)} active  (${pct(activeTokens, totalProcessed || 1)})`);
   }
+  L.push(`  ${V}`);
 
   // ── Compaction summaries ────────────────────────────────────────────
   if (summaries.length > 0) {
@@ -176,7 +142,7 @@ export async function buildContextDisplay(
           : s.summary;
       const oneLine = preview.replace(/\n/g, " ");
       const age = timeAgo(s.compactedAt);
-      L.push(`  ${V}  seg ${s.segmentIndex}  ${padR(age, 8)}  ${oneLine}`);
+      L.push(`  ${V}  #${s.segmentIndex}  ${padR(age, 8)}  ${oneLine}`);
     }
     L.push(`  ${V}`);
   }

@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 
 # Lockfiles (regenerated on install)
+bun.lock
 bun.lockb
 package-lock.json
 
@@ -16,6 +17,7 @@ Thumbs.db
 
 # Local OpenCode config
 .opencode/
+opencode.json
 
 # Environment
 .env

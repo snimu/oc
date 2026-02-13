@@ -144,7 +144,47 @@ export const RLMPlugin: Plugin = async (ctx) => {
       if (input.command === "context") {
         const state = sessionStates.get(input.sessionID);
         if (!state) return;
-        const display = await buildContextDisplay(state);
+
+        // Fetch real token usage from the most recent assistant message.
+        let modelInputTokens: number | undefined;
+        let contextLimit: number | undefined;
+        try {
+          const resp = await ctx.client.session.messages({
+            path: { id: input.sessionID },
+          });
+          const msgs = resp.data ?? [];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (m.info.role === "assistant" && (m.info as any).tokens) {
+              modelInputTokens = (m.info as any).tokens.input;
+              break;
+            }
+          }
+        } catch {
+          /* best-effort */
+        }
+
+        // Fetch model context limit.
+        try {
+          const providers = await ctx.client.config.providers({});
+          const providerList = (providers.data as any)?.providers ?? [];
+          for (const p of providerList) {
+            for (const m of p.models ?? []) {
+              if (m.limit?.context) {
+                contextLimit = m.limit.context;
+                break;
+              }
+            }
+            if (contextLimit) break;
+          }
+        } catch {
+          /* best-effort */
+        }
+
+        const display = await buildContextDisplay(state, {
+          modelInputTokens,
+          contextLimit,
+        });
         await ctx.client.session.prompt({
           path: { id: input.sessionID },
           body: {
