@@ -12,8 +12,6 @@ import {
   enqueueWrite,
   writeTrajectory,
 } from "./trajectory/manager";
-import { createReadTrajectoryTool } from "./tools/read-trajectory";
-import { createSearchTrajectoryTool } from "./tools/search-trajectory";
 
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
@@ -33,11 +31,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
         template: "Display the RLM context status below",
         description: "Show RLM context and trajectory status",
       };
-    },
-
-    tool: {
-      rlm_read_trajectory: createReadTrajectoryTool(sessionStates),
-      rlm_search_trajectory: createSearchTrajectoryTool(sessionStates),
     },
 
     event: async ({ event }) => {
@@ -203,8 +196,18 @@ export const RLMPlugin: Plugin = async (ctx) => {
       const state = sessionStates.get(input.sessionID);
       if (!state) return;
       output.system.push(
-        `You have a scratch directory for reading and writing intermediate files: ${state.varsDir}\n` +
-          `Use this directory to persist any state, notes, or intermediates that should survive across context compaction.`,
+        [
+          `## RLM (Recursive Language Model) scaffold`,
+          ``,
+          `Your full conversation trajectory is logged at: ${state.trajectoryPath}`,
+          `Read this file to recall past work after context compaction. It is append-only and managed by the scaffold — do not write to it.`,
+          ``,
+          `You have a persistent scratch directory at: ${state.varsDir}`,
+          `Use it to store plans, notes, intermediate results, or anything that should survive compaction. Prefer structured formats (JSON) so future reads are cheap.`,
+          ``,
+          `To spawn a recursive subtask, use: opencode run "{prompt}"`,
+          `The subtask runs in the same working directory and can read your vars.`,
+        ].join("\n"),
       );
     },
 
