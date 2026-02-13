@@ -4,7 +4,7 @@
 
 ## What it does
 
-- **Trajectory logging** — appends every turn to `active/trajectory.json` so nothing is lost on compaction
+- **Tracks full RLM history without discarding information** — appends every turn to `active/trajectory.json` so nothing is lost on compaction
   - The trajectory is stored as a single JSON document with segments and compaction summaries interleaved in order. After two compaction cycles the file looks like:
     ```json
     {
@@ -72,7 +72,7 @@
       }
     }
     ```
-- **Compaction-aware summaries** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
+- **Summarizes when root LM is full, but history still available in JSON** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
 - **System prompt for recursion** — tells the LM about its trajectory file, vars directory, and `opencode run` for spawning subtasks
   - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model. The plugin does **not** construct `{"role": "system", "content": "..."}` messages directly — it pushes to the array and OpenCode handles the rest. The injected text:
@@ -88,6 +88,8 @@
     To spawn a recursive subtask, use: opencode run "{prompt}"
     The subtask runs in the same working directory and can read your vars.
     ```
+
+Also provide a `/context` command for the user to view the current active history (on disk) + the LM's current context. Looks something like this:
 
 ## Installation
 
