@@ -7,11 +7,16 @@ import { handleSessionIdle } from "./hooks/session-idle";
 import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
+import { writeFileSync } from "fs";
+import { join } from "path";
 import {
   recordCompaction,
   enqueueWrite,
   writeTrajectory,
 } from "./trajectory/manager";
+
+const binDir = join(import.meta.dir, "..", "bin");
+const llmContextPath = "/tmp/rlm-llm-context.json";
 
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
@@ -25,6 +30,26 @@ export const RLMPlugin: Plugin = async (ctx) => {
   });
 
   return {
+    "chat.params": async (input: any) => {
+      const model = input.model;
+      const provider = input.provider;
+      const apiKey =
+        provider?.info?.key ||
+        (provider?.info?.env?.length
+          ? process.env[provider.info.env[0]]
+          : undefined) ||
+        "";
+      writeFileSync(
+        llmContextPath,
+        JSON.stringify({
+          modelId: model.id,
+          apiId: model.api.id,
+          apiUrl: model.api.url,
+          apiKey,
+        }),
+      );
+    },
+
     config: async (cfg: any) => {
       if (!cfg.command) cfg.command = {};
       cfg.command.context = {
@@ -207,6 +232,9 @@ export const RLMPlugin: Plugin = async (ctx) => {
           ``,
           `To spawn a recursive subtask, use: opencode run "{prompt}"`,
           `The subtask runs in the same working directory and can read your vars.`,
+          ``,
+          `For a single LLM call (no tools, no session), run: llm-subcall "prompt"`,
+          `It calls the same model and returns the response directly. Supports --system "system prompt" as an optional flag.`,
         ].join("\n"),
       );
     },
@@ -224,6 +252,11 @@ export const RLMPlugin: Plugin = async (ctx) => {
           },
         });
       }
+    },
+
+    "shell.env": async (_input: any, output: any) => {
+      output.env.RLM_LLM_CONTEXT = llmContextPath;
+      output.env.PATH = `${binDir}:${process.env.PATH}`;
     },
 
     "tool.execute.before": async (input, output) => {
