@@ -1,12 +1,13 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { loadConfig } from "./config";
-import { sessionStates } from "./session/state";
+import { sessionStates, sessionDepths } from "./session/state";
 import { removeSessionDirectory } from "./session/directory";
 import { handleSessionCreated } from "./hooks/session-created";
 import { handleSessionIdle } from "./hooks/session-idle";
 import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
+import { setupSubagentFunctions } from "./subagent/functions";
 import { writeFileSync } from "fs";
 import { join } from "path";
 import {
@@ -20,6 +21,22 @@ const llmContextPath = "/tmp/rlm-llm-context.json";
 
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
+
+  // Recursion depth for this process. Set by the parent's subagent function
+  // via env var prefix on `opencode run`. Root processes default to 0.
+  const processDepth = parseInt(process.env.OPENCODE_RLM_DEPTH || "0", 10);
+
+  // Server URL for list_tools bash helper
+  const serverUrl = ctx.serverUrl.toString().replace(/\/+$/, "");
+  const directory = ctx.directory;
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+  const authHeader = password
+    ? `authorization: Basic ${btoa(`${username}:${password}`)}`
+    : "";
+
+  // Set up subagent bash functions
+  const { functionsPath } = setupSubagentFunctions();
 
   await ctx.client.app.log({
     body: {
@@ -62,12 +79,14 @@ export const RLMPlugin: Plugin = async (ctx) => {
       try {
         if (event.type === "session.created") {
           const sessionId = event.properties.info.id;
+          sessionDepths.set(sessionId, processDepth);
+
           await handleSessionCreated(sessionId, config, sessionStates);
           await ctx.client.app.log({
             body: {
               service: "opencode-rlm",
               level: "info",
-              message: `Session initialized: ${sessionId}`,
+              message: `Session initialized: ${sessionId} (depth=${processDepth})`,
               extra: {
                 dir: sessionStates.get(sessionId)?.sessionDir,
               },
@@ -144,6 +163,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
               await removeSessionDirectory(state.sessionDir);
             }
             sessionStates.delete(sessionId);
+            sessionDepths.delete(sessionId);
           }
         }
       } catch (error: any) {
@@ -230,11 +250,20 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `You have a persistent scratch directory at: ${state.varsDir}`,
           `Use it to store plans, notes, intermediate results, or anything that should survive compaction. Prefer structured formats (JSON) so future reads are cheap.`,
           ``,
-          `To spawn a recursive subtask, use: opencode run "{prompt}"`,
-          `The subtask runs in the same working directory and can read your vars.`,
-          ``,
-          `For a single LLM call (no tools, no session), run: llm-subcall "prompt"`,
+          `For a single LLM call (no tools, no session), run in bash: llm-subcall "prompt"`,
           `It calls the same model and returns the response directly. Supports --system "system prompt" as an optional flag.`,
+          ``,
+          `To spawn a subagent (full OpenCode session with tools), run in bash: subagent '<prompt>'`,
+          `The subagent creates a child session, runs the prompt with full tool access, and returns the result.`,
+          `Beyond depth ${config.maxSubagentDepth}, subagent automatically falls back to llm-subcall.`,
+          ``,
+          `To run multiple subagents in parallel, run in bash: subagent_batch '<json array of prompts>'`,
+          `Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
+          `Each prompt runs as a separate subagent concurrently. Results are returned in order.`,
+          ``,
+          `To list available tool IDs, run in bash: list_tools`,
+          ``,
+          `These bash helpers are available in every bash invocation, including scripts run via bash.`,
         ].join("\n"),
       );
     },
@@ -257,6 +286,11 @@ export const RLMPlugin: Plugin = async (ctx) => {
     "shell.env": async (_input: any, output: any) => {
       output.env.RLM_LLM_CONTEXT = llmContextPath;
       output.env.PATH = `${binDir}:${process.env.PATH}`;
+      output.env.RLM_MAX_SUBAGENT_DEPTH = String(config.maxSubagentDepth);
+      // For list_tools bash helper
+      output.env.OPENCODE_RLM_URL = serverUrl;
+      output.env.OPENCODE_RLM_DIR_PATH = directory;
+      output.env.OPENCODE_AUTH_HEADER = authHeader;
     },
 
     "tool.execute.before": async (input, output) => {
@@ -274,6 +308,36 @@ export const RLMPlugin: Plugin = async (ctx) => {
               "Write intermediates to the vars/ directory instead.",
           );
         }
+      }
+
+      // Inject session ID, depth, and source subagent functions into every bash invocation.
+      // Depth is tracked server-side (per-session) so the LM cannot tamper with it.
+      if (input.tool === "bash" && output.args?.command) {
+        // Block LM attempts to override the depth variable
+        if (/OPENCODE_RLM_DEPTH\s*=/.test(output.args.command)) {
+          throw new Error(
+            "OPENCODE_RLM_DEPTH is managed by the RLM scaffold and cannot be modified. " +
+              "Subagent recursion depth is tracked automatically.",
+          );
+        }
+
+        const depth = sessionDepths.get(input.sessionID) ?? 0;
+        output.args.command =
+          `export OPENCODE_RLM_SESSION="${input.sessionID}"\n` +
+          `export OPENCODE_RLM_DEPTH=${depth}\n` +
+          `export BASH_ENV="${functionsPath}"\n` +
+          `source "${functionsPath}"\n` +
+          output.args.command;
+      }
+    },
+
+    "tool.execute.after": async (input, output) => {
+      if (input.tool !== "bash") return;
+      const cmd = input.args?.command ?? "";
+      if (cmd.includes("subagent_batch")) {
+        output.title = "subagent_batch";
+      } else if (cmd.includes("subagent ") && !cmd.includes("subagent_batch")) {
+        output.title = "subagent";
       }
     },
   };

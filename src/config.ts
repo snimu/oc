@@ -5,6 +5,7 @@ const DEFAULT_CONFIG: RLMConfig = {
   cleanupOnDelete: false,
   maxToolOutputChars: 50000,
   tokenEstimateMultiplier: 1.0,
+  maxSubagentDepth: 3,
 };
 
 export function loadConfig(): RLMConfig {
@@ -25,6 +26,12 @@ export function loadConfig(): RLMConfig {
   if (process.env.RLM_TOKEN_ESTIMATE_MULTIPLIER) {
     config.tokenEstimateMultiplier = parseFloat(
       process.env.RLM_TOKEN_ESTIMATE_MULTIPLIER,
+    );
+  }
+  if (process.env.RLM_MAX_SUBAGENT_DEPTH) {
+    config.maxSubagentDepth = parseInt(
+      process.env.RLM_MAX_SUBAGENT_DEPTH,
+      10,
     );
   }
 
