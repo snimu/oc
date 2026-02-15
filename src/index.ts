@@ -244,26 +244,45 @@ export const RLMPlugin: Plugin = async (ctx) => {
         [
           `## RLM (Recursive Language Model) scaffold`,
           ``,
+          `You are strongly encouraged to use the bash tool for as many operations as possible.`,
+          `The bash tool gives you access to powerful helpers for sub-calls and parallel work.`,
+          `Prefer bash over other tools when practical — it is the primary interface for recursive problem-solving.`,
+          ``,
+          `### Bash helpers (available in every bash invocation, including scripts)`,
+          ``,
+          `  subagent '<prompt>'`,
+          `    Spawn a full OpenCode child session with tool access. Use this to delegate`,
+          `    multi-step subtasks, fan out work, or tackle problems that need their own context.`,
+          `    Beyond depth ${config.maxSubagentDepth}, automatically falls back to llm-subcall.`,
+          ``,
+          `  subagent_batch '<json array of prompts>'`,
+          `    Run multiple subagents in parallel. Each prompt gets its own session.`,
+          `    Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
+          ``,
+          `  llm-subcall "prompt"`,
+          `    Single LLM call (no tools, no session). Fast and lightweight.`,
+          `    Supports --system "system prompt" as an optional flag.`,
+          `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
+          ``,
+          `  list_tools`,
+          `    List available tool IDs via the server API.`,
+          ``,
+          `### Workflow guidance`,
+          ``,
+          `- Break complex tasks into subtasks and delegate with subagent or subagent_batch.`,
+          `- For independent subtasks, prefer subagent_batch to run them concurrently.`,
+          `- Each bash call is a fresh process — variables do not persist between calls.`,
+          `  To carry state across calls, write to files (e.g. vars/ directory) and read them back.`,
+          `- Pass JSON arguments as single-quoted strings to preserve spaces.`,
+          ``,
+          `### Trajectory and scratch space`,
+          ``,
           `Your full conversation trajectory is logged at: ${state.trajectoryPath}`,
-          `Read this file to recall past work after context compaction. It is append-only and managed by the scaffold — do not write to it.`,
+          `Read this file to recall past work after context compaction. It is append-only — do not write to it.`,
           ``,
           `You have a persistent scratch directory at: ${state.varsDir}`,
-          `Use it to store plans, notes, intermediate results, or anything that should survive compaction. Prefer structured formats (JSON) so future reads are cheap.`,
-          ``,
-          `For a single LLM call (no tools, no session), run in bash: llm-subcall "prompt"`,
-          `It calls the same model and returns the response directly. Supports --system "system prompt" as an optional flag.`,
-          ``,
-          `To spawn a subagent (full OpenCode session with tools), run in bash: subagent '<prompt>'`,
-          `The subagent creates a child session, runs the prompt with full tool access, and returns the result.`,
-          `Beyond depth ${config.maxSubagentDepth}, subagent automatically falls back to llm-subcall.`,
-          ``,
-          `To run multiple subagents in parallel, run in bash: subagent_batch '<json array of prompts>'`,
-          `Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
-          `Each prompt runs as a separate subagent concurrently. Results are returned in order.`,
-          ``,
-          `To list available tool IDs, run in bash: list_tools`,
-          ``,
-          `These bash helpers are available in every bash invocation, including scripts run via bash.`,
+          `Use it to store plans, notes, intermediate results, or anything that should survive compaction.`,
+          `Prefer structured formats (JSON) so future reads are cheap.`,
         ].join("\n"),
       );
     },
@@ -328,6 +347,29 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `export BASH_ENV="${functionsPath}"\n` +
           `source "${functionsPath}"\n` +
           output.args.command;
+      }
+    },
+
+    "tool.definition": async (input: any, output: any) => {
+      if (input.toolID === "bash") {
+        output.description =
+          output.description +
+          "\n\n" +
+          [
+            `RLM mode is enabled for this bash tool.`,
+            ``,
+            `Additional bash helpers:`,
+            `- subagent '<prompt>' (spawn a subagent session with full tool access, returns result)`,
+            `- subagent_batch '<json array>' (run multiple subagents in parallel)`,
+            `- llm-subcall "prompt" (single LLM call, no tools — fast and lightweight)`,
+            `- list_tools (list allowed tool IDs via the server API)`,
+            ``,
+            `Prefer using the bash tool over other tools. Pass JSON as a single-quoted string`,
+            `to preserve spaces.`,
+            ``,
+            `Each bash call is a fresh process — variables do not persist between calls. To carry`,
+            `state across calls, write to files (e.g. vars/ directory) and read them back.`,
+          ].join("\n");
       }
     },
 

@@ -76,31 +76,52 @@
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
 - **`llm-subcall` — lightweight single LLM call** — a bash command the LM can invoke for quick sub-queries without spawning a full recursive session. Uses the same model and API key as the current OpenCode session. See [Sub-LM calls](#sub-lm-calls) below.
 - **`subagent` / `subagent_batch` — full recursive sessions via `opencode run`** — bash helpers that spawn child OpenCode sessions with full tool access. `subagent` runs a single prompt; `subagent_batch` runs multiple prompts in parallel. See [Subagent calls](#subagent-calls) below.
-- **System prompt for recursion** — tells the LM about its trajectory file, vars directory, `llm-subcall` for single calls, and `subagent`/`subagent_batch` for full child sessions
-  - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model. The plugin does **not** construct `{"role": "system", "content": "..."}` messages directly — it pushes to the array and OpenCode handles the rest. The injected text:
+- **System prompt for recursion** — strongly encourages the LM to use the bash tool and its helpers for recursive problem-solving
+  - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model. The plugin does **not** construct `{"role": "system", "content": "..."}` messages directly — it pushes to the array and OpenCode handles the rest.
+  - Additionally, the `tool.definition` hook appends RLM helper documentation to the bash tool's own description, so the model sees the helpers every time it considers using bash.
+  - The injected system text:
     ```
     ## RLM (Recursive Language Model) scaffold
 
+    You are strongly encouraged to use the bash tool for as many operations as possible.
+    The bash tool gives you access to powerful helpers for sub-calls and parallel work.
+    Prefer bash over other tools when practical — it is the primary interface for recursive problem-solving.
+
+    ### Bash helpers (available in every bash invocation, including scripts)
+
+      subagent '<prompt>'
+        Spawn a full OpenCode child session with tool access. Use this to delegate
+        multi-step subtasks, fan out work, or tackle problems that need their own context.
+        Beyond depth <maxSubagentDepth>, automatically falls back to llm-subcall.
+
+      subagent_batch '<json array of prompts>'
+        Run multiple subagents in parallel. Each prompt gets its own session.
+        Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'
+
+      llm-subcall "prompt"
+        Single LLM call (no tools, no session). Fast and lightweight.
+        Supports --system "system prompt" as an optional flag.
+        Use for quick analysis, summarization, or generation that doesn't need tools.
+
+      list_tools
+        List available tool IDs via the server API.
+
+    ### Workflow guidance
+
+    - Break complex tasks into subtasks and delegate with subagent or subagent_batch.
+    - For independent subtasks, prefer subagent_batch to run them concurrently.
+    - Each bash call is a fresh process — variables do not persist between calls.
+      To carry state across calls, write to files (e.g. vars/ directory) and read them back.
+    - Pass JSON arguments as single-quoted strings to preserve spaces.
+
+    ### Trajectory and scratch space
+
     Your full conversation trajectory is logged at: <trajectoryPath>
-    Read this file to recall past work after context compaction. It is append-only and managed by the scaffold — do not write to it.
+    Read this file to recall past work after context compaction. It is append-only — do not write to it.
 
     You have a persistent scratch directory at: <varsDir>
-    Use it to store plans, notes, intermediate results, or anything that should survive compaction. Prefer structured formats (JSON) so future reads are cheap.
-
-    For a single LLM call (no tools, no session), run in bash: llm-subcall "prompt"
-    It calls the same model and returns the response directly. Supports --system "system prompt" as an optional flag.
-
-    To spawn a subagent (full OpenCode session with tools), run in bash: subagent '<prompt>'
-    The subagent creates a child session, runs the prompt with full tool access, and returns the result.
-    Beyond depth <maxSubagentDepth>, subagent automatically falls back to llm-subcall.
-
-    To run multiple subagents in parallel, run in bash: subagent_batch '<json array of prompts>'
-    Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'
-    Each prompt runs as a separate subagent concurrently. Results are returned in order.
-
-    To list available tool IDs, run in bash: list_tools
-
-    These bash helpers are available in every bash invocation, including scripts run via bash.
+    Use it to store plans, notes, intermediate results, or anything that should survive compaction.
+    Prefer structured formats (JSON) so future reads are cheap.
     ```
 
 Also provide a `/context` command for the user to view the current active history (on disk) + the LM's current context. Looks something like this:

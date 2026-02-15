@@ -142,6 +142,13 @@ export async function buildContextDisplay(
   }
   L.push("");
 
+  L.push("Bash Helpers");
+  L.push(indent(`subagent '<prompt>'          — spawn child OpenCode session`));
+  L.push(indent(`subagent_batch '<json>'      — parallel subagents`));
+  L.push(indent(`llm-subcall "prompt"         — single LLM call (no tools)`));
+  L.push(indent(`list_tools                   — list available tool IDs`));
+  L.push("");
+
   L.push("Paths");
   L.push(indent(`session: ${state.sessionDir}`));
   L.push(indent(`full context: ${state.trajectoryPath}`));
