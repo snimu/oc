@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import { loadConfig } from "./config";
 import { sessionStates } from "./session/state";
 import { removeSessionDirectory } from "./session/directory";
@@ -8,8 +8,9 @@ import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
 import { formatSubagent, formatSubagentBatch } from "./subagent/format";
-import { writeFileSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import {
   recordCompaction,
   enqueueWrite,
@@ -18,28 +19,92 @@ import {
 
 const binDir = join(import.meta.dir, "..", "bin");
 const llmContextPath = "/tmp/rlm-llm-context.json";
+const rlmDir = join(tmpdir(), "opencode-rlm");
+mkdirSync(rlmDir, { recursive: true });
+const sessionIdPath = join(rlmDir, `session-id-pid-${process.pid}`);
 
 // DEBUG: /compact command — remove this block to disable
 let lastModelInfo: { providerID: string; modelID: string } | null = null;
 // END DEBUG
 
+/**
+ * Local proxy server that bridges bash curl calls to the OpenCode SDK client.
+ * Needed because the bash scripts can't use the Node SDK directly — they need
+ * HTTP endpoints. The proxy handles auth and request formatting.
+ */
+async function startProxyServer(client: PluginInput["client"]): Promise<string> {
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(req) {
+      const url = new URL(req.url);
+      const path = url.pathname;
+
+      try {
+        // GET /experimental/tool/ids
+        if (req.method === "GET" && path === "/experimental/tool/ids") {
+          const { data, error } = await client.tool.ids();
+          if (error) return Response.json(error, { status: 500 });
+          return Response.json(data);
+        }
+
+        // POST /session — create child session
+        if (req.method === "POST" && path === "/session") {
+          const body = await req.json();
+          const { data, error } = await client.session.create({ body });
+          if (error) return Response.json(error, { status: 500 });
+          return Response.json(data);
+        }
+
+        // POST /session/:id/prompt_async — send prompt asynchronously
+        const promptAsyncMatch = path.match(/^\/session\/([^/]+)\/prompt_async$/);
+        if (req.method === "POST" && promptAsyncMatch) {
+          const id = promptAsyncMatch[1];
+          const body = await req.json();
+          const { error } = await client.session.promptAsync({ path: { id }, body });
+          if (error) return Response.json(error, { status: 500 });
+          return new Response(null, { status: 204 });
+        }
+
+        // GET /session/status — get all session statuses
+        if (req.method === "GET" && path === "/session/status") {
+          const { data, error } = await client.session.status();
+          if (error) return Response.json(error, { status: 500 });
+          return Response.json(data);
+        }
+
+        // GET /session/:id/message — get session messages
+        const messagesMatch = path.match(/^\/session\/([^/]+)\/message$/);
+        if (req.method === "GET" && messagesMatch) {
+          const id = messagesMatch[1];
+          const { data, error } = await client.session.messages({ path: { id } });
+          if (error) return Response.json(error, { status: 500 });
+          return Response.json(data);
+        }
+
+        return new Response("Not Found", { status: 404 });
+      } catch (e: any) {
+        return Response.json({ error: e.message ?? String(e) }, { status: 500 });
+      }
+    },
+  });
+
+  return `http://127.0.0.1:${server.port}`;
+}
+
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
 
-  // Server URL for list_tools bash helper
-  const serverUrl = ctx.serverUrl.toString().replace(/\/+$/, "");
   const directory = ctx.directory;
-  const password = process.env.OPENCODE_SERVER_PASSWORD;
-  const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
-  const authHeader = password
-    ? `authorization: Basic ${btoa(`${username}:${password}`)}`
-    : "";
+
+  // Start proxy server for subagent bash scripts
+  const proxyUrl = await startProxyServer(ctx.client);
 
   await ctx.client.app.log({
     body: {
       service: "opencode-rlm",
       level: "info",
-      message: `RLM plugin loaded (baseDir=${config.baseDir})`,
+      message: `RLM plugin loaded (baseDir=${config.baseDir}, proxy=${proxyUrl})`,
     },
   });
 
@@ -66,6 +131,22 @@ export const RLMPlugin: Plugin = async (ctx) => {
     },
 
     config: async (cfg: any) => {
+      // Disable tools that have bash equivalents — forces the LM through bash
+      cfg.tools = cfg.tools ?? {};
+      for (const tool of [
+        "read",        // cat, head, tail
+        "glob",        // find, ls, shell globs
+        "grep",        // grep, rg
+        "edit",        // sed -i, awk
+        "write",       // heredocs, tee, cat >
+        "webfetch",    // curl
+        "codesearch",  // grep, rg
+        "apply_patch", // patch, git apply
+        "task",        // subagent, subagent_batch
+      ]) {
+        cfg.tools[tool] = false;
+      }
+
       if (!cfg.command) cfg.command = {};
       cfg.command.context = {
         template: "Display the RLM context status below",
@@ -300,27 +381,30 @@ export const RLMPlugin: Plugin = async (ctx) => {
         [
           `## RLM (Recursive Language Model) scaffold`,
           ``,
-          `**IMPORTANT: You MUST use the bash tool as your primary interface.** The bash tool`,
-          `gives you access to subagent spawning, parallel execution, and recursive problem-solving`,
-          `capabilities that are not available through any other tool. Always prefer bash over`,
-          `other tools — it is the core of your workflow.`,
+          `**IMPORTANT: You MUST use the bash tool as your primary interface.** Most other tools`,
+          `(read, write, edit, glob, grep, webfetch, etc.) are disabled. Use bash equivalents:`,
+          ``,
+          `- **File reading**: cat, head, tail, less`,
+          `- **File writing**: heredocs, tee, cat >, echo >>`,
+          `- **File editing**: sed -i, awk, or write to temp then mv`,
+          `- **Searching**: grep, rg, find, ls, shell globs`,
+          `- **Web fetching**: curl`,
+          `- **Subagents**: subagent, subagent_batch (see below)`,
           ``,
           `### Bash commands (available in every bash invocation)`,
           ``,
-          `  subagent '<prompt>' [--system 'system prompt']`,
-          `    Single LLM call (no tools, no session). Fast and lightweight.`,
-          `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
+          `  subagent '<prompt>'`,
+          `    Spawn a full OpenCode child session with tool access. The child session`,
+          `    is visible in the TUI via Ctrl-X. Use this to delegate multi-step subtasks,`,
+          `    fan out work, or tackle problems that need their own context.`,
           ``,
-          `  subagent_batch '<json array of prompts>' [--system 'system prompt']`,
-          `    Run multiple subagent LLM calls in parallel.`,
+          `  subagent_batch '<json array of prompts>'`,
+          `    Run multiple subagent sessions in parallel. Each prompt gets its own child session.`,
           `    Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
           ``,
           `  llm-subcall "prompt" [--system 'system prompt']`,
-          `    Alias for subagent. Single LLM call, no tools.`,
-          ``,
-          `  opencode run "prompt"`,
-          `    Spawn a full OpenCode child session with tool access. Use for multi-step tasks`,
-          `    that need their own context and tools.`,
+          `    Single LLM call (no tools, no session). Fast and lightweight.`,
+          `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
           ``,
           `  list_tools`,
           `    List available tool IDs via the server API.`,
@@ -354,7 +438,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `- **Always use bash** for file operations, analysis, and coordination.`,
           `- Break complex tasks into subtasks and delegate with subagent or subagent_batch.`,
           `- For independent subtasks, prefer subagent_batch to run them concurrently.`,
-          `- For multi-step tasks that need tool access, use \`opencode run "prompt"\`.`,
+          `- For quick LLM queries without tool access, use llm-subcall.`,
           `- Each bash call is a fresh process — variables do not persist between calls.`,
           `  To carry state across calls, write to files (e.g. vars/ directory) and read them back.`,
           `- Pass JSON arguments as single-quoted strings to preserve spaces.`,
@@ -408,13 +492,19 @@ export const RLMPlugin: Plugin = async (ctx) => {
     "shell.env": async (_input: any, output: any) => {
       output.env.RLM_LLM_CONTEXT = llmContextPath;
       output.env.PATH = `${binDir}:${process.env.PATH}`;
-      // For list_tools bash helper
-      output.env.OPENCODE_RLM_URL = serverUrl;
+      // Proxy URL for subagent and list_tools bash helpers
+      output.env.OPENCODE_RLM_URL = proxyUrl;
       output.env.OPENCODE_RLM_DIR_PATH = directory;
-      output.env.OPENCODE_AUTH_HEADER = authHeader;
+      // Session ID file — written by tool.execute.before, read by bin/subagent
+      output.env.OPENCODE_RLM_SESSION_ID_FILE = sessionIdPath;
     },
 
     "tool.execute.before": async (input, output) => {
+      // Write current session ID so bin/subagent can create child sessions
+      if (input.tool === "bash") {
+        writeFileSync(sessionIdPath, input.sessionID);
+      }
+
       if (input.tool === "write" || input.tool === "edit") {
         const targetPath =
           output.args?.filePath ||
@@ -438,17 +528,25 @@ export const RLMPlugin: Plugin = async (ctx) => {
           output.description +
           "\n\n" +
           [
-            `RLM mode is enabled. You MUST use this bash tool as your primary interface.`,
+            `RLM mode is enabled. Other tools (read, write, edit, glob, grep, etc.) are disabled.`,
+            `You MUST use this bash tool for all operations.`,
+            ``,
+            `Bash equivalents for disabled tools:`,
+            `- read → cat, head, tail`,
+            `- write → heredocs, tee, cat >`,
+            `- edit → sed -i, awk`,
+            `- glob → find, ls, shell globs`,
+            `- grep → grep, rg`,
+            `- webfetch → curl`,
             ``,
             `Available commands:`,
-            `- subagent '<prompt>' — single LLM call (fast, no tools)`,
-            `- subagent_batch '<json array>' — run multiple LLM calls in parallel`,
-            `- llm-subcall "prompt" — alias for subagent`,
-            `- opencode run "prompt" — full child session with tool access`,
+            `- subagent '<prompt>' — spawn a child session with full tool access (visible in Ctrl-X)`,
+            `- subagent_batch '<json array>' — run multiple subagent sessions in parallel`,
+            `- llm-subcall "prompt" — single LLM call (fast, no tools)`,
             `- list_tools — list available tool IDs`,
             ``,
-            `Always prefer bash. Pass JSON as single-quoted strings. Each call is a fresh`,
-            `process — persist state via files (e.g. vars/ directory).`,
+            `Pass JSON as single-quoted strings. Each call is a fresh process — persist`,
+            `state via files (e.g. vars/ directory).`,
           ].join("\n");
       }
     },

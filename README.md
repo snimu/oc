@@ -74,8 +74,9 @@
     ```
 - **Summarizes when root LM is full, but history still available in JSON** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
-- **`subagent` / `subagent_batch` — lightweight LLM calls** — bash commands the LM can invoke for quick sub-queries. `subagent` makes a single LLM call (no tools, no session); `subagent_batch` runs multiple prompts in parallel. Both support `--system` for custom system prompts. Uses the same model and API key as the current OpenCode session.
-- **`opencode run` — full recursive sessions** — for multi-step tasks that need tool access, the LM can spawn a full OpenCode child session via `opencode run "prompt"`.
+- **`subagent` / `subagent_batch` — full recursive sessions via the OpenCode API** — bash commands that spawn child OpenCode sessions with full tool access. `subagent` runs a single prompt; `subagent_batch` runs multiple prompts in parallel. Child sessions are visible in the TUI via Ctrl-X. See [Subagent calls](#subagent-calls) below.
+- **`llm-subcall` — lightweight single LLM call** — a bash command the LM can invoke for quick sub-queries without spawning a full session. Uses the same model and API key as the current OpenCode session. See [Sub-LM calls](#sub-lm-calls) below.
+- **Disables tools with bash equivalents** — the `config` hook disables `read`, `write`, `edit`, `glob`, `grep`, `webfetch`, `codesearch`, `apply_patch`, and `task`, forcing the LM to use bash for all operations. This keeps the workflow consistent and ensures all file operations go through the bash tool permission system.
 - **System prompt for recursion** — instructs the LM that it **must** use the bash tool as its primary interface for recursive problem-solving
   - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model.
   - The `tool.definition` hook appends RLM command documentation to the bash tool's own description.
@@ -84,27 +85,30 @@
     ```
     ## RLM (Recursive Language Model) scaffold
 
-    **IMPORTANT: You MUST use the bash tool as your primary interface.** The bash tool
-    gives you access to subagent spawning, parallel execution, and recursive problem-solving
-    capabilities that are not available through any other tool. Always prefer bash over
-    other tools — it is the core of your workflow.
+    **IMPORTANT: You MUST use the bash tool as your primary interface.** Most other tools
+    (read, write, edit, glob, grep, webfetch, etc.) are disabled. Use bash equivalents:
+
+    - File reading: cat, head, tail, less
+    - File writing: heredocs, tee, cat >, echo >>
+    - File editing: sed -i, awk, or write to temp then mv
+    - Searching: grep, rg, find, ls, shell globs
+    - Web fetching: curl
+    - Subagents: subagent, subagent_batch (see below)
 
     ### Bash commands (available in every bash invocation)
 
-      subagent '<prompt>' [--system 'system prompt']
-        Single LLM call (no tools, no session). Fast and lightweight.
-        Use for quick analysis, summarization, or generation that doesn't need tools.
+      subagent '<prompt>'
+        Spawn a full OpenCode child session with tool access. The child session
+        is visible in the TUI via Ctrl-X. Use this to delegate multi-step subtasks,
+        fan out work, or tackle problems that need their own context.
 
-      subagent_batch '<json array of prompts>' [--system 'system prompt']
-        Run multiple subagent LLM calls in parallel.
+      subagent_batch '<json array of prompts>'
+        Run multiple subagent sessions in parallel. Each prompt gets its own child session.
         Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'
 
       llm-subcall "prompt" [--system 'system prompt']
-        Alias for subagent. Single LLM call, no tools.
-
-      opencode run "prompt"
-        Spawn a full OpenCode child session with tool access. Use for multi-step tasks
-        that need their own context and tools.
+        Single LLM call (no tools, no session). Fast and lightweight.
+        Use for quick analysis, summarization, or generation that doesn't need tools.
 
       list_tools
         List available tool IDs via the server API.
@@ -138,7 +142,7 @@
     - **Always use bash** for file operations, analysis, and coordination.
     - Break complex tasks into subtasks and delegate with subagent or subagent_batch.
     - For independent subtasks, prefer subagent_batch to run them concurrently.
-    - For multi-step tasks that need tool access, use `opencode run "prompt"`.
+    - For quick LLM queries without tool access, use llm-subcall.
     - Each bash call is a fresh process — variables do not persist between calls.
       To carry state across calls, write to files (e.g. vars/ directory) and read them back.
     - Pass JSON arguments as single-quoted strings to preserve spaces.
@@ -174,48 +178,57 @@
 
 Also provide a `/context` command for the user to view the current active history (on disk) + the LM's current context. Looks something like this:
 
-## Sub-LM calls
+## Subagent calls
 
-The plugin provides `subagent` (and its alias `llm-subcall`), a bash command the LM can use to make a single LLM call inline — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
+The plugin provides `subagent` and `subagent_batch` as standalone scripts in `bin/`. These spawn **full OpenCode child sessions** with tool access via the OpenCode API. Child sessions are linked to the parent session (via `parentID`), making them visible in the TUI with Ctrl-X.
 
 ### How it works
 
-1. The `chat.params` hook fires before every LLM turn and writes the current model/provider info (model ID, API URL, API key) to `/tmp/rlm-llm-context.json`.
-2. The `shell.env` hook adds `bin/` to `PATH` and sets `RLM_LLM_CONTEXT` to point at the context file.
-3. When the LM runs `subagent` via bash, it delegates to `llm-subcall`, which reads the context, makes a single API call (Anthropic or OpenAI-compatible, depending on the provider), and prints the response to stdout.
+1. The `tool.execute.before` hook writes the current session ID to a file before each bash invocation.
+2. The `shell.env` hook adds `bin/` to `PATH` and sets `OPENCODE_RLM_URL` (local proxy) and `OPENCODE_RLM_SESSION_ID_FILE`.
+3. When the LM runs `subagent`, the script:
+   - Reads the parent session ID from the file
+   - Creates a child session via `POST /session` with `parentID`
+   - Sends the prompt via `POST /session/:id/prompt_async`
+   - Polls `GET /session/status` until the child session is idle
+   - Reads the last assistant message via `GET /session/:id/message`
 
 ### Usage (as the LM would invoke it)
 
 ```bash
-# Simple prompt
-subagent "Summarize the following error log: $(cat /tmp/errors.log)"
+# Single subagent (full session with tools, visible in Ctrl-X)
+subagent 'Review src/auth.ts for security issues and suggest fixes'
 
-# With a system prompt
-subagent --system "You are a senior code reviewer. Be concise." "Review this diff for bugs: $(git diff HEAD~1)"
+# Parallel subagents — runs all prompts concurrently
+subagent_batch '["Analyze src/auth.ts for bugs", "Review src/api.ts for performance", "Check test coverage in src/"]'
 
-# Capture output into a variable
-ANALYSIS=$(subagent "What does this function do? $(cat src/auth.ts)")
-echo "$ANALYSIS" > vars/analysis.txt
+# Capture output
+RESULT=$(subagent 'Summarize the architecture of this project')
+echo "$RESULT" > vars/architecture.txt
 
-# Chain with other commands
-subagent "Generate a regex that matches ISO 8601 dates" | tee vars/regex.txt
-
-# Parallel LLM calls
-subagent_batch '["Summarize file A", "Summarize file B", "Summarize file C"]' --system "Be concise"
-
-# Full recursive session (when tools are needed)
-opencode run "Refactor src/auth.ts to use JWT tokens"
+# Quick LLM call (no tools, fast)
+SUMMARY=$(llm-subcall "Summarize this error: $(cat /tmp/errors.log)")
 ```
+
+## Sub-LM calls
+
+The plugin also provides `llm-subcall`, a lightweight bash command for single LLM calls — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
+
+### How it works
+
+1. The `chat.params` hook fires before every LLM turn and writes the current model/provider info (model ID, API URL, API key) to `/tmp/rlm-llm-context.json`.
+2. The `shell.env` hook sets `RLM_LLM_CONTEXT` to point at the context file.
+3. `llm-subcall` reads the context, makes a single API call (Anthropic or OpenAI-compatible), and prints the response to stdout.
 
 ### When to use what
 
-| | `subagent` / `llm-subcall` | `subagent_batch` | `opencode run` |
+| | `subagent` | `subagent_batch` | `llm-subcall` |
 |---|---|---|---|
-| **What it does** | Single LLM call | Parallel LLM calls | Full recursive session |
-| **Has tools?** | No | No | Yes |
-| **Has trajectory?** | No | No | Yes |
-| **Overhead** | Minimal | Minimal | Full session |
-| **Use case** | Quick analysis | Batch summarization | Multi-step tasks |
+| **What it does** | Full child session | Parallel child sessions | Single LLM call |
+| **Has tools?** | Yes | Yes | No |
+| **Visible in Ctrl-X?** | Yes | Yes | No |
+| **Overhead** | Full session | Full session per prompt | Minimal |
+| **Use case** | Multi-step tasks | Fan-out work | Quick analysis |
 
 ## Installation
 
@@ -244,7 +257,8 @@ Register in `opencode.json` (project root) or `~/.config/opencode/opencode.json`
     trajectory.json    # Full trajectory log (read-only for the LM)
   vars/                # Scratch directory (LM reads/writes freely)
 
-/tmp/rlm-llm-context.json           # Model/provider context for llm-subcall (updated each turn)
+/tmp/rlm-llm-context.json                    # Model/provider context for llm-subcall (updated each turn)
+/tmp/opencode-rlm/session-id-pid-<pid>       # Current session ID (written by tool.execute.before, read by bin/subagent)
 ```
 
 ## Configuration

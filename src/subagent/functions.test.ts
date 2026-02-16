@@ -1,15 +1,14 @@
-import { describe, test, expect, beforeAll } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { existsSync, readFileSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import type { Server } from "bun";
 
 // bin/ directory with the real standalone scripts
 const binDir = join(import.meta.dir, "..", "..", "bin");
 
 /**
  * Helper: run a bash snippet with bin/ scripts on PATH.
- * We stub `llm-subcall` with a simple echo script
- * so we can verify which path subagent takes without needing a real server.
  */
 async function runBash(
   script: string,
@@ -26,42 +25,100 @@ async function runBash(
   return { exitCode, stdout: stdout.trimEnd(), stderr: stderr.trimEnd() };
 }
 
-// ── Setup ───────────────────────────────────────────────────────────
+// ── Mock OpenCode API server ────────────────────────────────────────
 
-let stubDir: string;
+let mockServer: Server;
+let mockServerUrl: string;
+let sessionIdFile: string;
+
+// Track created sessions and their prompts
+const sessions = new Map<string, { parentID: string; prompts: string[] }>();
+let nextSessionId = 1;
 
 beforeAll(() => {
-  // Create stub script for `llm-subcall` that echoes a marker
-  stubDir = join(tmpdir(), "opencode-rlm-test-stubs");
-  const { mkdirSync } = require("fs");
-  mkdirSync(stubDir, { recursive: true });
+  // Write a session ID file (simulates what tool.execute.before does)
+  sessionIdFile = join(tmpdir(), "opencode-rlm-test-session-id");
+  writeFileSync(sessionIdFile, "parent-session-123");
 
-  // Stub llm-subcall: echoes "LLM_SUBCALL:<prompt>" and passes through --system
-  writeFileSync(
-    join(stubDir, "llm-subcall"),
-    `#!/usr/bin/env bash
-prompt=""
-system=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --system) system="$2"; shift 2 ;;
-    *) prompt="$1"; shift ;;
-  esac
-done
-if [[ -n "$system" ]]; then
-  echo "LLM_SUBCALL:$prompt SYSTEM:$system"
-else
-  echo "LLM_SUBCALL:$prompt"
-fi
-`,
-    { mode: 0o755 },
-  );
+  // Start a mock OpenCode API server
+  mockServer = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(req) {
+      const url = new URL(req.url);
+      const path = url.pathname;
+
+      // POST /session — create child session
+      if (req.method === "POST" && path === "/session") {
+        const body = await req.json();
+        const id = `child-session-${nextSessionId++}`;
+        sessions.set(id, { parentID: body.parentID ?? "", prompts: [] });
+        return Response.json({ id });
+      }
+
+      // POST /session/:id/prompt_async — send prompt
+      const promptMatch = path.match(/^\/session\/([^/]+)\/prompt_async$/);
+      if (req.method === "POST" && promptMatch) {
+        const id = promptMatch[1];
+        const body = await req.json();
+        const promptText = body.parts?.[0]?.text ?? "";
+        const sess = sessions.get(id);
+        if (sess) sess.prompts.push(promptText);
+        return new Response(null, { status: 204 });
+      }
+
+      // GET /session/status — always return idle
+      if (req.method === "GET" && path === "/session/status") {
+        const status: Record<string, { type: string }> = {};
+        for (const [id] of sessions) {
+          status[id] = { type: "idle" };
+        }
+        return Response.json(status);
+      }
+
+      // GET /session/:id/message — return mock assistant message
+      const msgMatch = path.match(/^\/session\/([^/]+)\/message$/);
+      if (req.method === "GET" && msgMatch) {
+        const id = msgMatch[1];
+        const sess = sessions.get(id);
+        const prompt = sess?.prompts[sess.prompts.length - 1] ?? "unknown";
+        return Response.json([
+          {
+            info: { role: "assistant" },
+            parts: [{ type: "text", text: `SUBAGENT_RESULT:${prompt} PARENT:${sess?.parentID}` }],
+          },
+        ]);
+      }
+
+      // GET /experimental/tool/ids
+      if (req.method === "GET" && path === "/experimental/tool/ids") {
+        return Response.json(["bash", "read", "write", "edit", "glob", "grep"]);
+      }
+
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+
+  mockServerUrl = `http://127.0.0.1:${mockServer.port}`;
 });
 
-/** Build a command with stubs and bin/ scripts on PATH */
+afterAll(() => {
+  mockServer.stop();
+});
+
+/** Build env vars for running bin/ scripts against the mock server */
+function testEnv(): Record<string, string> {
+  return {
+    OPENCODE_RLM_URL: mockServerUrl,
+    OPENCODE_RLM_DIR_PATH: "/test/project",
+    OPENCODE_AUTH_HEADER: "",
+    OPENCODE_RLM_SESSION_ID_FILE: sessionIdFile,
+  };
+}
+
+/** Build a command with bin/ scripts on PATH */
 function cmd(script: string): string {
-  // stubs first so they override real llm-subcall, then bin/ for subagent etc.
-  return `export PATH="${stubDir}:${binDir}:$PATH"\n${script}`;
+  return `export PATH="${binDir}:$PATH"\n${script}`;
 }
 
 // ── bin/ scripts validation ─────────────────────────────────────────
@@ -110,46 +167,62 @@ describe("bin/ scripts", () => {
     const content = readFileSync(join(binDir, "subagent"), "utf-8");
     expect(content.startsWith("#!/usr/bin/env bash")).toBe(true);
   });
-
-  test("llm_subcall_batch does not exist (removed)", () => {
-    const p = join(binDir, "llm_subcall_batch");
-    expect(existsSync(p)).toBe(false);
-  });
 });
 
-// ── subagent calls llm-subcall ──────────────────────────────────────
+// ── subagent creates child session ──────────────────────────────────
 
-describe("subagent (LLM call)", () => {
-  test("calls llm-subcall with the prompt", async () => {
+describe("subagent (child session)", () => {
+  test("creates a child session and returns result", async () => {
     const { exitCode, stdout } = await runBash(
       cmd('subagent "analyze this"'),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:analyze this");
+    expect(stdout).toContain("SUBAGENT_RESULT:analyze this");
   });
 
-  test("passes --system flag through to llm-subcall", async () => {
-    const { exitCode, stdout } = await runBash(
-      cmd('subagent "analyze this" --system "Be concise"'),
+  test("passes parent session ID to child session", async () => {
+    const { stdout } = await runBash(
+      cmd('subagent "check parent"'),
+      testEnv(),
     );
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:analyze this");
-    expect(stdout).toContain("SYSTEM:Be concise");
+    expect(stdout).toContain("PARENT:parent-session-123");
+  });
+
+  test("with no prompt, prints usage and returns 2", async () => {
+    const { exitCode, stderr } = await runBash(
+      cmd("subagent"),
+      testEnv(),
+    );
+    expect(exitCode).toBe(2);
+    expect(stderr).toContain("subagent");
+  });
+
+  test("with empty prompt, prints usage and returns 2", async () => {
+    const { exitCode, stderr } = await runBash(
+      cmd('subagent ""'),
+      testEnv(),
+    );
+    expect(exitCode).toBe(2);
+    expect(stderr).toContain("subagent");
   });
 
   test("prompt with spaces is preserved", async () => {
     const { stdout } = await runBash(
       cmd('subagent "analyze the auth module in src/auth.ts"'),
+      testEnv(),
     );
-    expect(stdout).toContain("LLM_SUBCALL:analyze the auth module in src/auth.ts");
+    expect(stdout).toContain("SUBAGENT_RESULT:analyze the auth module in src/auth.ts");
   });
 
-  test("prompt with special characters is preserved", async () => {
-    const { exitCode, stdout } = await runBash(
-      cmd(`subagent 'Review this: "hello world"'`),
+  test("fails gracefully without session ID file", async () => {
+    const env = { ...testEnv(), OPENCODE_RLM_SESSION_ID_FILE: "/nonexistent/file" };
+    const { exitCode, stderr } = await runBash(
+      cmd('subagent "no session"'),
+      env,
     );
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:");
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain("session ID");
   });
 });
 
@@ -159,27 +232,30 @@ describe("subagent output capture", () => {
   test("stdout from subagent can be captured in a variable", async () => {
     const { exitCode, stdout } = await runBash(
       cmd('RESULT=$(subagent "capture me")\necho "GOT:$RESULT"'),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("GOT:LLM_SUBCALL:capture me");
+    expect(stdout).toContain("GOT:SUBAGENT_RESULT:capture me");
   });
 
   test("stdout from subagent can be piped", async () => {
     const { exitCode, stdout } = await runBash(
       cmd('subagent "pipe me" | tr "a-z" "A-Z"'),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:");
+    expect(stdout).toContain("SUBAGENT_RESULT:");
   });
 
   test("stdout from subagent can be written to a file", async () => {
     const outFile = join(tmpdir(), "opencode-rlm-test-out.txt");
     const { exitCode } = await runBash(
       cmd(`subagent "file output" > "${outFile}"`),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
     const content = readFileSync(outFile, "utf-8");
-    expect(content).toContain("LLM_SUBCALL:file output");
+    expect(content).toContain("SUBAGENT_RESULT:file output");
   });
 });
 
@@ -189,24 +265,18 @@ describe("subagent_batch", () => {
   test("runs multiple prompts and collects output", async () => {
     const { exitCode, stdout } = await runBash(
       cmd(`subagent_batch '["prompt one","prompt two","prompt three"]'`),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:prompt one");
-    expect(stdout).toContain("LLM_SUBCALL:prompt two");
-    expect(stdout).toContain("LLM_SUBCALL:prompt three");
-  });
-
-  test("passes --system flag through to each subagent", async () => {
-    const { exitCode, stdout } = await runBash(
-      cmd(`subagent_batch '["first","second"]' --system "Be brief"`),
-    );
-    expect(exitCode).toBe(0);
-    expect(stdout).toContain("SYSTEM:Be brief");
+    expect(stdout).toContain("SUBAGENT_RESULT:prompt one");
+    expect(stdout).toContain("SUBAGENT_RESULT:prompt two");
+    expect(stdout).toContain("SUBAGENT_RESULT:prompt three");
   });
 
   test("reports agent count on stderr", async () => {
     const { stderr } = await runBash(
       cmd(`subagent_batch '["a","b"]'`),
+      testEnv(),
     );
     expect(stderr).toContain("Agent 1/2");
     expect(stderr).toContain("Agent 2/2");
@@ -216,6 +286,7 @@ describe("subagent_batch", () => {
   test("with no argument, prints usage and returns 2", async () => {
     const { exitCode, stderr } = await runBash(
       cmd("subagent_batch"),
+      testEnv(),
     );
     expect(exitCode).toBe(2);
     expect(stderr).toContain("subagent_batch");
@@ -224,19 +295,21 @@ describe("subagent_batch", () => {
   test("handles single-element batch", async () => {
     const { exitCode, stdout } = await runBash(
       cmd(`subagent_batch '["only one"]'`),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("LLM_SUBCALL:only one");
+    expect(stdout).toContain("SUBAGENT_RESULT:only one");
   });
 
   test("handles large batch (5 prompts)", async () => {
     const prompts = JSON.stringify(["p1", "p2", "p3", "p4", "p5"]);
     const { exitCode, stdout, stderr } = await runBash(
       cmd(`subagent_batch '${prompts}'`),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
     for (let i = 1; i <= 5; i++) {
-      expect(stdout).toContain(`LLM_SUBCALL:p${i}`);
+      expect(stdout).toContain(`SUBAGENT_RESULT:p${i}`);
       expect(stderr).toContain(`Agent ${i}/5`);
     }
     expect(stderr).toContain("5/5 agents completed");
@@ -245,15 +318,17 @@ describe("subagent_batch", () => {
   test("batch output can be captured in a variable", async () => {
     const { stdout } = await runBash(
       cmd(`RESULT=$(subagent_batch '["x","y"]')\necho "BATCH:$RESULT"`),
+      testEnv(),
     );
     expect(stdout).toContain("BATCH:");
-    expect(stdout).toContain("LLM_SUBCALL:x");
-    expect(stdout).toContain("LLM_SUBCALL:y");
+    expect(stdout).toContain("SUBAGENT_RESULT:x");
+    expect(stdout).toContain("SUBAGENT_RESULT:y");
   });
 
   test("batch cleans up temp directory", async () => {
     const { exitCode } = await runBash(
       cmd(`subagent_batch '["cleanup test"]'`),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
   });
@@ -261,14 +336,16 @@ describe("subagent_batch", () => {
   test("batch with prompts containing spaces", async () => {
     const { stdout } = await runBash(
       cmd(`subagent_batch '["analyze src/auth.ts","review the api layer"]'`),
+      testEnv(),
     );
-    expect(stdout).toContain("LLM_SUBCALL:analyze src/auth.ts");
-    expect(stdout).toContain("LLM_SUBCALL:review the api layer");
+    expect(stdout).toContain("SUBAGENT_RESULT:analyze src/auth.ts");
+    expect(stdout).toContain("SUBAGENT_RESULT:review the api layer");
   });
 
   test("batch stderr shows agent headers in order", async () => {
     const { stderr } = await runBash(
       cmd(`subagent_batch '["x","y","z"]'`),
+      testEnv(),
     );
     const idx1 = stderr.indexOf("Agent 1/3");
     const idx2 = stderr.indexOf("Agent 2/3");
@@ -276,54 +353,6 @@ describe("subagent_batch", () => {
     expect(idx1).toBeGreaterThanOrEqual(0);
     expect(idx2).toBeGreaterThan(idx1);
     expect(idx3).toBeGreaterThan(idx2);
-  });
-});
-
-// ── subagent_batch error handling ───────────────────────────────────
-
-describe("subagent_batch error handling", () => {
-  test("reports failed agents when llm-subcall returns error", async () => {
-    const failStubDir = join(tmpdir(), "opencode-rlm-test-fail-stubs");
-    const { mkdirSync } = require("fs");
-    mkdirSync(failStubDir, { recursive: true });
-
-    writeFileSync(
-      join(failStubDir, "llm-subcall"),
-      `#!/usr/bin/env bash
-echo "ERROR: something went wrong" >&2
-exit 1
-`,
-      { mode: 0o755 },
-    );
-
-    const { stderr } = await runBash(
-      `export PATH="${failStubDir}:${binDir}:$PATH"\nsubagent_batch '["fail1","fail2"]'`,
-    );
-    expect(stderr).toContain("[error]");
-    expect(stderr).toContain("0/2 agents completed");
-  });
-
-  test("handles mixed success and empty output", async () => {
-    const mixStubDir = join(tmpdir(), "opencode-rlm-test-mix-stubs2");
-    const { mkdirSync } = require("fs");
-    mkdirSync(mixStubDir, { recursive: true });
-
-    writeFileSync(
-      join(mixStubDir, "llm-subcall"),
-      `#!/usr/bin/env bash
-if [[ "$1" == *"good"* ]]; then
-  echo "LLM_SUBCALL:$1"
-fi
-`,
-      { mode: 0o755 },
-    );
-
-    const { stdout, stderr } = await runBash(
-      `export PATH="${mixStubDir}:${binDir}:$PATH"\nsubagent_batch '["good one","bad one","good two"]'`,
-    );
-    expect(stdout).toContain("LLM_SUBCALL:good one");
-    expect(stdout).toContain("LLM_SUBCALL:good two");
-    expect(stderr).toContain("2/3 agents completed");
   });
 });
 
@@ -338,11 +367,12 @@ describe("chained subagent calls", () => {
         'R3=$(subagent "third")',
         'echo "R1:$R1 R2:$R2 R3:$R3"',
       ].join("\n")),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("R1:LLM_SUBCALL:first");
-    expect(stdout).toContain("R2:LLM_SUBCALL:second");
-    expect(stdout).toContain("R3:LLM_SUBCALL:third");
+    expect(stdout).toContain("R1:SUBAGENT_RESULT:first");
+    expect(stdout).toContain("R2:SUBAGENT_RESULT:second");
+    expect(stdout).toContain("R3:SUBAGENT_RESULT:third");
   });
 
   test("subagent followed by subagent_batch", async () => {
@@ -353,11 +383,12 @@ describe("chained subagent calls", () => {
         'echo "SINGLE:$SINGLE"',
         'echo "BATCH:$BATCH"',
       ].join("\n")),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("SINGLE:LLM_SUBCALL:single first");
-    expect(stdout).toContain("LLM_SUBCALL:batch a");
-    expect(stdout).toContain("LLM_SUBCALL:batch b");
+    expect(stdout).toContain("SINGLE:SUBAGENT_RESULT:single first");
+    expect(stdout).toContain("SUBAGENT_RESULT:batch a");
+    expect(stdout).toContain("SUBAGENT_RESULT:batch b");
   });
 
   test("subagent result used as input to next subagent", async () => {
@@ -366,8 +397,23 @@ describe("chained subagent calls", () => {
         'STEP1=$(subagent "analyze code")',
         'subagent "summarize: $STEP1"',
       ].join("\n")),
+      testEnv(),
     );
     expect(exitCode).toBe(0);
-    expect(stdout).toContain("summarize: LLM_SUBCALL:analyze code");
+    expect(stdout).toContain("summarize: SUBAGENT_RESULT:analyze code");
+  });
+});
+
+// ── list_tools ──────────────────────────────────────────────────────
+
+describe("list_tools", () => {
+  test("returns tool IDs from mock server", async () => {
+    const { exitCode, stdout } = await runBash(
+      cmd("list_tools"),
+      testEnv(),
+    );
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("bash");
+    expect(stdout).toContain("read");
   });
 });

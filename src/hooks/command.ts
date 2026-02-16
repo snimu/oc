@@ -167,10 +167,9 @@ export async function buildContextDisplay(
   L.push("");
 
   L.push("Bash Commands");
-  L.push(indent(`subagent '<prompt>'          — single LLM call (no tools)`));
-  L.push(indent(`subagent_batch '<json>'      — parallel LLM calls`));
-  L.push(indent(`llm-subcall "prompt"         — alias for subagent`));
-  L.push(indent(`opencode run "prompt"        — full child session with tools`));
+  L.push(indent(`subagent '<prompt>'          — child session with tools (Ctrl-X to view)`));
+  L.push(indent(`subagent_batch '<json>'      — parallel subagent sessions`));
+  L.push(indent(`llm-subcall "prompt"         — single LLM call (no tools, fast)`));
   L.push(indent(`list_tools                   — list available tool IDs`));
   L.push("");
 

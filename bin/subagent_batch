@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
-# Run multiple subagent (LLM) calls in parallel.
-# Usage: subagent_batch '<json array of prompts>' [--system 'system prompt']
+# Run multiple subagent sessions in parallel. Each prompt gets its own child session.
+# Usage: subagent_batch '<json array of prompts>'
 
 json="$1"
-if [[ -z "$json" ]]; then echo "usage: subagent_batch '<json array>' [--system 'prompt']" >&2; exit 2; fi
-shift
-
-# Collect remaining args (e.g. --system "...")
-extra_args=("$@")
+if [[ -z "$json" ]]; then echo "usage: subagent_batch '<json array>'" >&2; exit 2; fi
 
 batchdir=$(mktemp -d)
 pids=()
 i=0
 
 while IFS= read -r prompt; do
-  ( subagent "$prompt" "${extra_args[@]}" > "$batchdir/$i.out" 2>"$batchdir/$i.err" ) &
+  ( subagent "$prompt" > "$batchdir/$i.out" 2>"$batchdir/$i.err" ) &
   pids+=($!)
   i=$((i + 1))
 done < <(printf '%s' "$json" | jq -r '.[]')
