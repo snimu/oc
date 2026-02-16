@@ -4,7 +4,6 @@ const DEFAULT_CONFIG: RLMConfig = {
   baseDir: "/tmp/rlm",
   cleanupOnDelete: false,
   maxToolOutputChars: 50000,
-  tokenEstimateMultiplier: 1.0,
 };
 
 export function loadConfig(): RLMConfig {
@@ -20,11 +19,6 @@ export function loadConfig(): RLMConfig {
     config.maxToolOutputChars = parseInt(
       process.env.RLM_MAX_TOOL_OUTPUT_CHARS,
       10,
-    );
-  }
-  if (process.env.RLM_TOKEN_ESTIMATE_MULTIPLIER) {
-    config.tokenEstimateMultiplier = parseFloat(
-      process.env.RLM_TOKEN_ESTIMATE_MULTIPLIER,
     );
   }
 

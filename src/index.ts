@@ -150,65 +150,155 @@ subagent() {
   printf '%s' "$result"
 }
 
+# subagent_batch: calls the streaming /session/run-batch endpoint.
+# All sessions run in parallel on the server. Progress is streamed live
+# with agent labels. Once all agents finish, the interleaved output is
+# wiped and replaced with a clean grouped-by-agent view.
 subagent_batch() {
-  local json="$1"
-  if [[ -z "$json" ]]; then echo "subagent_batch <json array>" >&2; return 2; fi
-  local tmpdir
-  tmpdir="/tmp/rlm/batch-$$-$RANDOM"
-  mkdir -p "$tmpdir"
-  local pids=()
-  local i=0
-  local depth=\${OPENCODE_RLM_DEPTH:-0}
+  local json="\${1:-}"
+  if [[ -z "$json" && ! -t 0 ]]; then
+    json=\$(cat)
+  fi
+  if [[ -z "$json" ]]; then echo "Usage: subagent_batch '<json array>' or subagent_batch <<'EOF'" >&2; return 2; fi
+
+  local H="content-type: application/json"
+  local auth_args=()
+  if [[ -n "$OPENCODE_AUTH_HEADER" ]]; then auth_args=(-H "$OPENCODE_AUTH_HEADER"); fi
   local indent
   indent=$(_rlm_indent)
 
   local count
-  count=$(printf '%s' "$json" | jq 'length')
+  count=$(printf '%s' "$json" | jq 'length' 2>/dev/null) || count="?"
+
+  # Build JSON body safely with jq
+  local body
+  body=$(jq -n --arg pid "$OPENCODE_RLM_SESSION" --argjson prompts "$json" \\
+    '{parentID: $pid, prompts: $prompts}')
+
+  # Header (2 lines — counted for ANSI wipe later)
   printf '%s┌─ subagent_batch (%s agents) ──\\n' "$indent" "$count" >&2
+  printf '%s├───────────────────────────────\\n' "$indent" >&2
+  local line_count=2
 
-  # Increment depth for child subagents
-  export OPENCODE_RLM_DEPTH=$((depth + 1))
-
-  while IFS= read -r prompt; do
-    ( subagent "$prompt" > "$tmpdir/$i.out" 2>"$tmpdir/$i.err" ) &
-    pids+=($!)
-    i=$((i + 1))
-  done < <(printf '%s' "$json" | jq -r '.[]')
-
-  local total=$i
-  for pid in "\${pids[@]}"; do wait "$pid"; done
-
-  # Restore depth
-  export OPENCODE_RLM_DEPTH=$depth
+  # Temp dir for per-agent progress logs and results
+  local batch_dir="/tmp/rlm/batch-$$-$RANDOM"
+  mkdir -p "$batch_dir"
 
   local succeeded=0
-  local failed=0
-  local out err
-  for ((j=0; j<total; j++)); do
-    printf '%s├─ Agent %d/%d ─────────────────\\n' "$indent" "$((j + 1))" "$total" >&2
-    out=$(cat "$tmpdir/$j.out")
-    err=$(cat "$tmpdir/$j.err")
-    if [[ -n "$out" ]]; then
-      # Show progress from stderr (contains the subagent's box output)
-      if [[ -n "$err" ]]; then
-        printf '%s' "$err" | while IFS= read -r line; do
-          printf '%s│ %s\\n' "$indent" "$line" >&2
-        done
-      fi
-      printf '%s\\n' "$out"
-      succeeded=$((succeeded + 1))
-    elif [[ -n "$err" ]]; then
-      printf '%s│ %s\\n' "$indent" "$err" >&2
-      printf '[error] %s\\n' "$err"
-      failed=$((failed + 1))
-    else
-      printf '%s│ [no output]\\n' "$indent" >&2
-      printf '[no output]\\n'
-      failed=$((failed + 1))
+  local total_done=0
+  local had_error=0
+  local etype=""
+  local etext=""
+  local eagent=""
+
+  while IFS= read -r _rlm_line; do
+    [[ -z "$_rlm_line" ]] && continue
+    etype="$(printf '%s' "$_rlm_line" | jq -r '.type // empty' 2>/dev/null)" || etype=""
+    etext="$(printf '%s' "$_rlm_line" | jq -r '.text // empty' 2>/dev/null)" || etext=""
+    eagent="$(printf '%s' "$_rlm_line" | jq -r '.agent // empty' 2>/dev/null)" || eagent=""
+
+    case "$etype" in
+      progress)
+        if [[ "$eagent" == "-1" ]]; then
+          printf '%s│ %s\\n' "$indent" "$etext" >&2
+          line_count=\$((line_count + 1))
+        else
+          local anum=\$((eagent + 1))
+          local line_text="[Sub-agent \${anum}] \${etext}"
+          printf '%s│ %s\\n' "$indent" "$line_text" >&2
+          line_count=\$((line_count + 1))
+          # Buffer per-agent progress for grouped replay
+          printf '%s\\n' "$etext" >> "$batch_dir/progress_$eagent"
+        fi
+        ;;
+      result)
+        local anum=\$((eagent + 1))
+        # Store result for ordered output
+        printf '%s' "$etext" > "$batch_dir/result_$eagent"
+        local rpreview
+        rpreview=$(printf '%s' "$etext" | head -c 80 | tr '\\n' ' ')
+        [[ \${#etext} -gt 80 ]] && rpreview="\${rpreview}..."
+        printf '%s│ [Sub-agent %s] ✓ done: %s\\n' "$indent" "$anum" "$rpreview" >&2
+        line_count=\$((line_count + 1))
+        ;;
+      error)
+        if [[ "$eagent" == "-1" ]]; then
+          printf '%s│ [error] %s\\n' "$indent" "$etext" >&2
+          line_count=\$((line_count + 1))
+        else
+          local anum=\$((eagent + 1))
+          printf '%s│ [Sub-agent %s] ✗ %s\\n' "$indent" "$anum" "$etext" >&2
+          line_count=\$((line_count + 1))
+          printf '✗ %s\\n' "$etext" >> "$batch_dir/progress_$eagent"
+        fi
+        had_error=1
+        ;;
+      done)
+        succeeded="$(printf '%s' "$_rlm_line" | jq -r '.succeeded // 0' 2>/dev/null)" || succeeded=0
+        total_done="$(printf '%s' "$_rlm_line" | jq -r '.total // 0' 2>/dev/null)" || total_done=0
+        ;;
+      heartbeat)
+        ;;
+    esac
+  done < <(curl -sS -N --max-time 600 -X POST "$OPENCODE_RLM_URL/session/run-batch" \\
+    -H "$H" "\${auth_args[@]}" \\
+    -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH" \\
+    -d "$body")
+
+  # ── Wipe interleaved output and reprint grouped by agent ──
+  # Move cursor up by line_count lines, then clear to end of screen
+  printf '\\033[%dA\\033[J' "$line_count" >&2
+
+  # Reprint header
+  printf '%s┌─ subagent_batch (%s/%s succeeded) ──\\n' "$indent" "$succeeded" "$total_done" >&2
+  printf '%s├───────────────────────────────\\n' "$indent" >&2
+
+  # Print each agent's progress grouped together
+  local i=0
+  while [[ $i -lt \${count:-0} ]]; do
+    local anum=\$((i + 1))
+    printf '%s│\\n' "$indent" >&2
+    printf '%s│ ┌ Sub-agent %s\\n' "$indent" "$anum" >&2
+    # Show buffered progress lines indented under this agent
+    if [[ -f "$batch_dir/progress_$i" ]]; then
+      while IFS= read -r pline; do
+        printf '%s│ │ %s\\n' "$indent" "$pline" >&2
+      done < "$batch_dir/progress_$i"
     fi
+    # Show result preview
+    if [[ -f "$batch_dir/result_$i" ]]; then
+      local res
+      res=$(cat "$batch_dir/result_$i")
+      local rpreview
+      rpreview=$(printf '%s' "$res" | head -c 100 | tr '\\n' ' ')
+      [[ \${#res} -gt 100 ]] && rpreview="\${rpreview}..."
+      printf '%s│ └ ✓ %s\\n' "$indent" "$rpreview" >&2
+    else
+      printf '%s│ └ ✗ (no output)\\n' "$indent" >&2
+    fi
+    i=\$((i + 1))
   done
-  printf '%s└─ %d/%d agents completed ──────\\n' "$indent" "$succeeded" "$total" >&2
-  rm -rf "$tmpdir"
+
+  # Footer + results on stdout
+  printf '%s├─ output ──────────────────────\\n' "$indent" >&2
+  i=0
+  while [[ $i -lt \${count:-0} ]]; do
+    if [[ -f "$batch_dir/result_$i" ]]; then
+      local res
+      res=$(cat "$batch_dir/result_$i")
+      if [[ -n "$res" ]]; then
+        printf '%s\\n' "$res"
+      fi
+    fi
+    i=\$((i + 1))
+  done
+
+  printf '%s└───────────────────────────────\\n' "$indent" >&2
+  rm -rf "$batch_dir"
+
+  if [[ $had_error -eq 1 && $succeeded -eq 0 ]]; then
+    return 1
+  fi
 }
 `;
 }
@@ -457,6 +547,196 @@ async function startProxyServer(
           });
         }
 
+        // POST /session/run-batch — create N sessions, prompt all, stream interleaved progress
+        // Body: { parentID, prompts: string[] }
+        // Response: newline-delimited JSON events:
+        //   {"type":"progress","agent":0,"text":"..."} — tool call progress
+        //   {"type":"result","agent":0,"text":"..."}   — final result for agent N
+        //   {"type":"done","succeeded":N,"total":M}    — all agents finished
+        //   {"type":"error","agent":0,"text":"..."}    — error for agent N
+        //   {"type":"heartbeat"}                       — keep-alive
+        if (req.method === "POST" && path === "/session/run-batch") {
+          const body = await req.json();
+          const { parentID, prompts } = body as { parentID: string; prompts: string[] };
+
+          if (!prompts || !Array.isArray(prompts) || prompts.length === 0) {
+            return Response.json({ error: "prompts must be a non-empty array" }, { status: 400 });
+          }
+
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            async start(controller) {
+              const send = (obj: any) => {
+                try {
+                  controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+                } catch { /* stream closed */ }
+              };
+
+              try {
+                const total = prompts.length;
+
+                // 1. Create all child sessions
+                const sessions: Array<{ id: string; prompt: string; agentIdx: number }> = [];
+                for (let i = 0; i < total; i++) {
+                  const { data: sess, error: createErr } = await client.session.create({
+                    body: { parentID },
+                  });
+                  if (createErr || !sess) {
+                    send({ type: "error", agent: i, text: `Failed to create session: ${JSON.stringify(createErr)}` });
+                    continue;
+                  }
+                  const sid = (sess as any).id;
+                  childSessionIds.add(sid);
+                  sessions.push({ id: sid, prompt: prompts[i], agentIdx: i });
+                }
+
+                // 2. Send prompts to all sessions (don't await sequentially — fire them off)
+                await Promise.all(sessions.map(async (s) => {
+                  const { error: promptErr } = await client.session.promptAsync({
+                    path: { id: s.id },
+                    body: {
+                      parts: [{ type: "text", text: s.prompt }],
+                      agent: "general",
+                    },
+                  });
+                  if (promptErr) {
+                    send({ type: "error", agent: s.agentIdx, text: `Failed to send prompt: ${JSON.stringify(promptErr)}` });
+                  }
+                }));
+
+                send({ type: "progress", agent: -1, text: `Started ${sessions.length}/${total} agents` });
+
+                // 3. Poll all sessions, streaming interleaved progress
+                const seenPartsPerAgent = new Map<string, Set<string>>();
+                const completedAgents = new Set<number>();
+                const results = new Map<number, string>();
+                const seenBusyPerAgent = new Map<string, boolean>();
+                const idleCountPerAgent = new Map<string, number>();
+                const IDLE_COOLDOWN = 6;
+                const POLL_INTERVAL = 500;
+                let heartbeatCounter = 0;
+
+                for (const s of sessions) {
+                  seenPartsPerAgent.set(s.id, new Set());
+                  seenBusyPerAgent.set(s.id, false);
+                  idleCountPerAgent.set(s.id, 0);
+                }
+
+                while (completedAgents.size < sessions.length) {
+                  // Heartbeat
+                  heartbeatCounter++;
+                  if (heartbeatCounter % 4 === 0) {
+                    send({ type: "heartbeat" });
+                  }
+
+                  // Check status of all sessions at once
+                  let allStatuses: any = {};
+                  try {
+                    const { data: statuses } = await client.session.status();
+                    allStatuses = statuses ?? {};
+                  } catch { /* continue */ }
+
+                  for (const s of sessions) {
+                    if (completedAgents.has(s.agentIdx)) continue;
+
+                    const status = allStatuses[s.id]?.type ?? "idle";
+                    const seenBusy = seenBusyPerAgent.get(s.id)!;
+
+                    if (status === "busy") {
+                      seenBusyPerAgent.set(s.id, true);
+                      idleCountPerAgent.set(s.id, 0);
+                    } else if (!seenBusy) {
+                      // Not yet started — keep waiting (up to global timeout)
+                      continue;
+                    } else {
+                      // Was busy, now idle — cooldown
+                      const count = (idleCountPerAgent.get(s.id) ?? 0) + 1;
+                      idleCountPerAgent.set(s.id, count);
+                      if (count < IDLE_COOLDOWN) continue;
+
+                      // Agent is done — fetch final result
+                      completedAgents.add(s.agentIdx);
+                      try {
+                        const { data: finalMsgs } = await client.session.messages({ path: { id: s.id } });
+                        let result = "";
+                        if (finalMsgs && Array.isArray(finalMsgs)) {
+                          for (let i = finalMsgs.length - 1; i >= 0; i--) {
+                            const msg = finalMsgs[i];
+                            if (msg.info?.role === "assistant") {
+                              const textParts = (msg.parts ?? [])
+                                .filter((p: any) => p.type === "text")
+                                .map((p: any) => p.text ?? "");
+                              result = textParts.join("\n");
+
+                              // Send final tool states
+                              for (const part of msg.parts ?? []) {
+                                if (part.type !== "tool") continue;
+                                const line = formatToolPart(part);
+                                if (line) send({ type: "progress", agent: s.agentIdx, text: line });
+                              }
+                              break;
+                            }
+                          }
+                        }
+                        results.set(s.agentIdx, result || "(no response)");
+                        send({ type: "result", agent: s.agentIdx, text: result || "(no response)" });
+                      } catch (e: any) {
+                        send({ type: "error", agent: s.agentIdx, text: e.message ?? String(e) });
+                        results.set(s.agentIdx, "");
+                      }
+                      continue;
+                    }
+
+                    // Fetch messages for active agents and stream new tool calls
+                    try {
+                      const seenParts = seenPartsPerAgent.get(s.id)!;
+                      const { data: msgs } = await client.session.messages({ path: { id: s.id } });
+                      if (msgs && Array.isArray(msgs)) {
+                        for (const msg of msgs) {
+                          if (msg.info?.role !== "assistant") continue;
+                          for (const part of msg.parts ?? []) {
+                            if (part.type !== "tool") continue;
+                            const partKey = `${(part as any).id ?? ""}:${(part as any).state?.status ?? ""}`;
+                            if (seenParts.has(partKey)) continue;
+                            seenParts.add(partKey);
+                            const line = formatToolPart(part);
+                            if (line) send({ type: "progress", agent: s.agentIdx, text: line });
+                          }
+                        }
+                      }
+                    } catch { /* best-effort */ }
+                  }
+
+                  // Check for global timeout (agents that never went busy)
+                  heartbeatCounter++;
+                  if (heartbeatCounter > 600) { // 5 minutes
+                    for (const s of sessions) {
+                      if (!completedAgents.has(s.agentIdx)) {
+                        send({ type: "error", agent: s.agentIdx, text: "Timed out" });
+                        completedAgents.add(s.agentIdx);
+                        results.set(s.agentIdx, "");
+                      }
+                    }
+                    break;
+                  }
+
+                  await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+                }
+
+                send({ type: "done", succeeded: [...results.values()].filter(v => v.length > 0).length, total });
+              } catch (e: any) {
+                send({ type: "error", agent: -1, text: e.message ?? String(e) });
+              }
+
+              controller.close();
+            },
+          });
+
+          return new Response(stream, {
+            headers: { "content-type": "application/x-ndjson" },
+          });
+        }
+
         // POST /session/:id/prompt_async
         const promptAsyncMatch = path.match(/^\/session\/([^/]+)\/prompt_async$/);
         if (req.method === "POST" && promptAsyncMatch) {
@@ -581,10 +861,14 @@ export const RLMPlugin: Plugin = async (ctx) => {
       // All RLM data (sessions, trajectories, vars, functions, batches) lives here.
       cfg.permission = cfg.permission ?? {};
       if (typeof cfg.permission !== "string") {
-        cfg.permission.bash = cfg.permission.bash ?? {};
-        if (typeof cfg.permission.bash !== "string") {
-          cfg.permission.bash["/tmp/rlm/**"] = "allow";
+        // If bash permission is a global string (e.g. "ask"), convert to object
+        // so we can add path-specific overrides while preserving the default.
+        const existingBash = cfg.permission.bash;
+        if (typeof existingBash === "string" || !existingBash) {
+          cfg.permission.bash = {};
         }
+        cfg.permission.bash["/tmp/rlm/**"] = "allow";
+        cfg.permission.bash["/private/tmp/rlm/**"] = "allow"; // macOS resolves /tmp → /private/tmp
       }
 
       if (!cfg.command) cfg.command = {};
@@ -657,11 +941,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
               summaryText = "(compaction occurred but summary not found)";
             }
 
-            recordCompaction(
-              state.document,
-              summaryText,
-              config.tokenEstimateMultiplier,
-            );
+            recordCompaction(state.document, summaryText);
             await enqueueWrite(state, () =>
               writeTrajectory(state.trajectoryPath, state.document),
             );
@@ -706,19 +986,55 @@ export const RLMPlugin: Plugin = async (ctx) => {
         const state = sessionStates.get(input.sessionID);
         if (!state) return;
 
-        let modelInputTokens: number | undefined;
+        let lastUsage: import("./hooks/command").TokenUsage | undefined;
+        let totalUsage: import("./hooks/command").TokenUsage | undefined;
         let contextLimit: number | undefined;
+        let messageCount = 0;
+
         try {
           const resp = await ctx.client.session.messages({
             path: { id: input.sessionID },
           });
           const msgs = resp.data ?? [];
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            const m = msgs[i];
-            if (m.info.role === "assistant" && (m.info as any).tokens) {
-              modelInputTokens = (m.info as any).tokens.input;
-              break;
+          messageCount = msgs.length;
+
+          // Grab the last assistant message for current context size,
+          // and sum output/reasoning/cost across all messages (those are per-call).
+          // NOTE: tokens.input is NOT summed — each call's input already includes
+          // the full conversation history, so summing would massively overcount.
+          const totals = { output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+          for (const m of msgs) {
+            if (m.info.role === "assistant") {
+              const tokens = (m.info as any).tokens;
+              const cost = (m.info as any).cost ?? 0;
+              if (tokens) {
+                totals.output += tokens.output ?? 0;
+                totals.reasoning += tokens.reasoning ?? 0;
+                totals.cacheRead += tokens.cache?.read ?? 0;
+                totals.cacheWrite += tokens.cache?.write ?? 0;
+                totals.cost += cost;
+
+                // Keep updating — last one wins (= current context size)
+                lastUsage = {
+                  input: tokens.input ?? 0,
+                  output: tokens.output ?? 0,
+                  reasoning: tokens.reasoning ?? 0,
+                  cacheRead: tokens.cache?.read ?? 0,
+                  cacheWrite: tokens.cache?.write ?? 0,
+                  cost,
+                };
+              }
             }
+          }
+          if (lastUsage) {
+            totalUsage = {
+              input: lastUsage.input, // Current context size (not summed)
+              output: totals.output,
+              reasoning: totals.reasoning,
+              cacheRead: totals.cacheRead,
+              cacheWrite: totals.cacheWrite,
+              cost: totals.cost,
+            };
           }
         } catch {
           /* best-effort */
@@ -741,8 +1057,10 @@ export const RLMPlugin: Plugin = async (ctx) => {
         }
 
         const display = await buildContextDisplay(state, {
-          modelInputTokens,
+          lastUsage,
+          totalUsage,
           contextLimit,
+          messageCount,
         });
 
         await ctx.client.session.prompt({
@@ -923,6 +1241,8 @@ export const RLMPlugin: Plugin = async (ctx) => {
       // Source bash functions into every bash command (snimu pattern)
       if (input.tool === "bash" && output.args?.command) {
         writeFileSync(sessionIdPath, input.sessionID);
+        // Rewrite /private/tmp/rlm → /tmp/rlm (macOS resolves /tmp to /private/tmp)
+        output.args.command = output.args.command.replaceAll("/private/tmp/rlm", "/tmp/rlm");
         output.args.command = `source "${functionsPath}"\n` + output.args.command;
       }
 

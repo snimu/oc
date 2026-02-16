@@ -54,9 +54,25 @@ function indent(text: string): string {
     .join("\n");
 }
 
+/** Token usage from OpenCode's actual model response. */
+export interface TokenUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+}
+
 export interface ContextDisplayOpts {
-  modelInputTokens?: number;
+  /** Token usage from the last assistant message (actual model-reported values). */
+  lastUsage?: TokenUsage;
+  /** Cumulative totals across all assistant messages in this session. */
+  totalUsage?: TokenUsage;
+  /** Context window limit from model config. */
   contextLimit?: number;
+  /** Number of messages in the session. */
+  messageCount?: number;
 }
 
 export async function buildContextDisplay(
@@ -66,21 +82,7 @@ export async function buildContextDisplay(
   const doc = state.document;
   const active = getActiveSegment(doc);
   const summaries = getRecentSummaries(doc, 3);
-
-  const activeTurns = active?.turns.length ?? 0;
-  const activeEstimatedTokens = active?.totalEstimatedTokens ?? 0;
   const compactions = doc.stats.totalCompactions;
-
-  // Compacted tokens = sum of all non-active segment estimates
-  const compactedEstimatedTokens = doc.stats.totalTokensProcessed - activeEstimatedTokens;
-
-  // Use actual model tokens for root context when available, otherwise fall back to estimate
-  const rootTokens = opts.modelInputTokens ?? activeEstimatedTokens;
-  const rootIsActual = opts.modelInputTokens != null;
-
-  // Total = root context + compacted history estimates
-  // This ensures total >= root always
-  const totalTokens = rootTokens + compactedEstimatedTokens;
 
   const varsEntries: Array<{ name: string; size: number; path: string }> = [];
   try {
@@ -100,30 +102,51 @@ export async function buildContextDisplay(
   L.push("----------------------------------------");
   L.push("");
 
-  L.push("Root Model Context");
-  if (rootIsActual) {
-    let line = `${fmt(rootTokens)} input tokens`;
+  // ── Current context (from OpenCode's actual token counts) ──
+  L.push("Current Context");
+  if (opts.lastUsage) {
+    const u = opts.lastUsage;
+    let line = `${fmt(u.input)} input tokens`;
     if (opts.contextLimit) {
-      line += ` / ${fmt(opts.contextLimit)} limit (${pct(rootTokens, opts.contextLimit)})`;
+      line += ` / ${fmt(opts.contextLimit)} limit (${pct(u.input, opts.contextLimit)})`;
     }
     L.push(indent(line));
+    L.push(indent(`${fmt(u.output)} output, ${fmt(u.reasoning)} reasoning`));
+    if (u.cacheRead > 0 || u.cacheWrite > 0) {
+      L.push(indent(`cache: ${fmt(u.cacheRead)} read, ${fmt(u.cacheWrite)} write`));
+    }
   } else {
-    L.push(indent(`~${fmt(rootTokens)} tokens (estimated — send a message for actual count)`));
+    L.push(indent("(no messages yet — send a message to see actual token counts)"));
   }
-  let turnsLine = `${fmt(activeTurns)} turns in current segment`;
-  if (active?.startedAt) {
-    turnsLine += `, started ${timeAgo(active.startedAt)}`;
+  if (opts.messageCount != null) {
+    L.push(indent(`${opts.messageCount} messages in session`));
   }
-  L.push(indent(turnsLine));
   L.push("");
 
-  L.push("Total RLM Context");
-  L.push(indent(`~${fmt(totalTokens)} tokens total, ${doc.stats.totalTurns} turns`));
-  if (compactions > 0) {
-    L.push(indent(`~${fmt(compactedEstimatedTokens)} compacted, ${compactions} compaction${compactions === 1 ? "" : "s"}`));
-    L.push(indent(`${rootIsActual ? "" : "~"}${fmt(rootTokens)} active (current segment)`));
+  // ── Session totals (cumulative output/cost, NOT input — input is already full context) ──
+  if (opts.totalUsage) {
+    const t = opts.totalUsage;
+    L.push("Session Totals");
+    L.push(indent(`${fmt(t.output)} output tokens, ${fmt(t.reasoning)} reasoning tokens`));
+    if (t.cost > 0) {
+      L.push(indent(`$${t.cost.toFixed(4)} total cost`));
+    }
+    L.push("");
   }
-  L.push("");
+
+  // ── Compaction info ──
+  if (compactions > 0) {
+    L.push("Compactions");
+    L.push(indent(`${compactions} compaction${compactions === 1 ? "" : "s"}`));
+    if (active?.turns.length) {
+      let turnsLine = `${active.turns.length} turns in current segment`;
+      if (active.startedAt) {
+        turnsLine += `, started ${timeAgo(active.startedAt)}`;
+      }
+      L.push(indent(turnsLine));
+    }
+    L.push("");
+  }
 
   if (summaries.length > 0) {
     L.push("Compaction History");
@@ -137,10 +160,10 @@ export async function buildContextDisplay(
     L.push("");
   }
 
+  // ── Trajectory ──
   L.push("Trajectory");
   L.push(indent(`file: ${state.trajectoryPath}`));
   L.push(indent(`${doc.entries.length} entries, ${doc.stats.totalTurns} turns, ${doc.stats.totalCompactions} compactions`));
-  // Peek at first and last turns
   const allTurns: Array<{ role: string; content: string; timestamp: string }> = [];
   for (const entry of doc.entries) {
     if (entry.type === "segment") {
@@ -161,6 +184,7 @@ export async function buildContextDisplay(
   }
   L.push("");
 
+  // ── Vars ──
   L.push("REPL Variables");
   if (varsEntries.length === 0) {
     L.push(indent("(empty)"));
@@ -177,15 +201,15 @@ export async function buildContextDisplay(
 
   L.push("Bash Commands");
   L.push(indent(`subagent '<prompt>'          — child session (streams tool calls)`));
-  L.push(indent(`subagent_batch '<json>'      — parallel child sessions`));
+  L.push(indent(`subagent_batch '<json>'      — parallel child sessions (streaming)`));
   L.push(indent(`llm-subcall "prompt"         — single LLM call (no tools, fast)`));
   L.push(indent(`list_tools                   — list available tool IDs`));
   L.push("");
 
   L.push("Paths");
   L.push(indent(`session: ${state.sessionDir}`));
-  L.push(indent(`full context: ${state.trajectoryPath}`));
-  L.push(indent(`repl vars: ${state.varsDir}`));
+  L.push(indent(`trajectory: ${state.trajectoryPath}`));
+  L.push(indent(`vars: ${state.varsDir}`));
 
   return L.join("\n");
 }

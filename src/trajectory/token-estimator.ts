@@ -3,7 +3,7 @@
  * ~90-95% accuracy for English text and code.
  * Conservative bias (slightly overcounts).
  */
-export function estimateTokens(text: string, multiplier: number = 1.0): number {
+export function estimateTokens(text: string): number {
   let tokens = 0;
   let prevSpace = false;
 
@@ -41,5 +41,5 @@ export function estimateTokens(text: string, multiplier: number = 1.0): number {
     }
   }
 
-  return Math.ceil(tokens * multiplier);
+  return Math.ceil(tokens);
 }

@@ -55,7 +55,7 @@ export async function handleSessionIdle(
           globalTurnIndex++,
           role as "user" | "assistant",
           content,
-          config.tokenEstimateMultiplier,
+
         );
         appendTurn(state.document, turn);
       } else if (part.type === "tool") {
@@ -71,7 +71,7 @@ export async function handleSessionIdle(
           globalTurnIndex++,
           "tool_use",
           `Tool call: ${toolName}`,
-          config.tokenEstimateMultiplier,
+
           toolName,
           inputStr,
         );
@@ -93,7 +93,7 @@ export async function handleSessionIdle(
             globalTurnIndex++,
             "tool_result",
             truncated,
-            config.tokenEstimateMultiplier,
+  
             toolName,
           );
           appendTurn(state.document, resultTurn);
@@ -102,7 +102,7 @@ export async function handleSessionIdle(
             globalTurnIndex++,
             "tool_result",
             `Error: ${toolState.error}`,
-            config.tokenEstimateMultiplier,
+  
             toolName,
           );
           appendTurn(state.document, resultTurn);

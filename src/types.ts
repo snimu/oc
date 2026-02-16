@@ -66,6 +66,4 @@ export interface RLMConfig {
   cleanupOnDelete: boolean;
   /** Max chars to store per tool result turn. Default: 50000 */
   maxToolOutputChars: number;
-  /** Multiplier for token estimator tuning. Default: 1.0 */
-  tokenEstimateMultiplier: number;
 }

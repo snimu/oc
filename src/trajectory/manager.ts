@@ -68,7 +68,6 @@ export function createTurn(
   turnIndex: number,
   role: TrajectoryTurn["role"],
   content: string,
-  multiplier: number,
   toolName?: string,
   toolArgs?: string,
 ): TrajectoryTurn {
@@ -76,7 +75,7 @@ export function createTurn(
     turnIndex,
     role,
     content,
-    estimatedTokens: estimateTokens(content, multiplier),
+    estimatedTokens: estimateTokens(content),
     timestamp: new Date().toISOString(),
     toolName,
     toolArgs,
@@ -87,7 +86,6 @@ export function createTurn(
 export function recordCompaction(
   doc: TrajectoryDocument,
   summary: string,
-  multiplier: number,
 ): void {
   const active = getActiveSegment(doc);
   if (!active) return;
@@ -102,7 +100,7 @@ export function recordCompaction(
     type: "compaction",
     segmentIndex: active.segmentIndex,
     summary,
-    summaryTokens: estimateTokens(summary, multiplier),
+    summaryTokens: estimateTokens(summary),
     originalTokens: active.totalEstimatedTokens,
     compactedAt: now,
   };

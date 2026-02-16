@@ -13,20 +13,13 @@ import {
 } from "./manager";
 import type { TrajectoryDocument } from "../types";
 
-const MULTIPLIER = 1.0;
-
 function addUserTurn(doc: TrajectoryDocument, content: string) {
-  const turn = createTurn(doc.stats.totalTurns, "user", content, MULTIPLIER);
+  const turn = createTurn(doc.stats.totalTurns, "user", content);
   appendTurn(doc, turn);
 }
 
 function addAssistantTurn(doc: TrajectoryDocument, content: string) {
-  const turn = createTurn(
-    doc.stats.totalTurns,
-    "assistant",
-    content,
-    MULTIPLIER,
-  );
+  const turn = createTurn(doc.stats.totalTurns, "assistant", content);
   appendTurn(doc, turn);
 }
 
@@ -35,7 +28,6 @@ function addToolTurns(doc: TrajectoryDocument, name: string, output: string) {
     doc.stats.totalTurns,
     "tool_use",
     `Tool call: ${name}`,
-    MULTIPLIER,
     name,
     '{"path":"src/index.ts"}',
   );
@@ -44,7 +36,6 @@ function addToolTurns(doc: TrajectoryDocument, name: string, output: string) {
     doc.stats.totalTurns,
     "tool_result",
     output,
-    MULTIPLIER,
     name,
   );
   appendTurn(doc, result);
@@ -141,7 +132,6 @@ describe("single compaction", () => {
       "Added dark mode toggle to Settings.tsx with localStorage persistence. " +
         "Modified Settings component to include a toggle switch that saves " +
         "the user's theme preference to localStorage.",
-      MULTIPLIER,
     );
 
     // Document now has 3 entries: frozen segment 0 + compaction + active segment 1
@@ -236,7 +226,6 @@ describe("multiple compactions", () => {
     recordCompaction(
       doc,
       "Created REST API routes for user management with CRUD endpoints in routes/users.ts.",
-      MULTIPLIER,
     );
 
     expect(doc.stats.totalCompactions).toBe(1);
@@ -261,7 +250,6 @@ describe("multiple compactions", () => {
       doc,
       "Added JWT auth middleware in middleware/auth.ts and applied it to " +
         "all user management routes. Previous: Created CRUD API in routes/users.ts.",
-      MULTIPLIER,
     );
 
     expect(doc.stats.totalCompactions).toBe(2);
@@ -388,7 +376,7 @@ describe("trajectory.json serialized format", () => {
     addUserTurn(doc, "Hello");
     addAssistantTurn(doc, "Hi there!");
 
-    recordCompaction(doc, "Greeted the user.", MULTIPLIER);
+    recordCompaction(doc, "Greeted the user.");
 
     addUserTurn(doc, "What time is it?");
     addAssistantTurn(doc, "I don't have access to the current time.");
