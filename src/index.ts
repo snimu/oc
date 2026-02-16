@@ -7,7 +7,6 @@ import { handleSessionIdle } from "./hooks/session-idle";
 import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
-import { formatSubagent, formatSubagentBatch } from "./subagent/format";
 import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -17,22 +16,231 @@ import {
   writeTrajectory,
 } from "./trajectory/manager";
 
-const binDir = join(import.meta.dir, "..", "bin");
 const llmContextPath = "/tmp/rlm-llm-context.json";
-const rlmDir = join(tmpdir(), "opencode-rlm");
-mkdirSync(rlmDir, { recursive: true });
-const sessionIdPath = join(rlmDir, `session-id-pid-${process.pid}`);
 
-// DEBUG: /compact command — remove this block to disable
-let lastModelInfo: { providerID: string; modelID: string } | null = null;
-// END DEBUG
+/**
+ * Generate the bash functions script that gets sourced into every bash invocation.
+ * This is the same pattern snimu/opencode-rlm uses — functions are defined at source
+ * time so they're available immediately in the bash process.
+ */
+function buildBashFunctionsScript(sessionIdPath: string, llmCliPath: string): string {
+  return `#!/usr/bin/env bash
+export OPENCODE_RLM_SESSION="\$(cat "${sessionIdPath}")"
+export OPENCODE_RLM_DEPTH="\${OPENCODE_RLM_DEPTH:-0}"
+
+# llm-subcall: single LLM call (no tools, no session)
+llm-subcall() {
+  bun "${llmCliPath}" "$@"
+}
+
+# Build indent prefix based on nesting depth
+_rlm_indent() {
+  local d=\${OPENCODE_RLM_DEPTH:-0}
+  local prefix=""
+  for ((k=0; k<d; k++)); do prefix="  \${prefix}"; done
+  printf '%s' "$prefix"
+}
+
+list_tools() {
+  local auth_args=()
+  if [[ -n "$OPENCODE_AUTH_HEADER" ]]; then auth_args=(-H "$OPENCODE_AUTH_HEADER"); fi
+  curl -sS "$OPENCODE_RLM_URL/experimental/tool/ids" \\
+    "\${auth_args[@]}" \\
+    -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH"
+}
+
+# subagent: calls the streaming /session/run endpoint.
+# The proxy handles session creation, prompting, polling, and progress streaming.
+# Progress lines (tool calls) go to stderr; the final result goes to stdout.
+#
+# Usage:
+#   subagent 'prompt'            — prompt as argument
+#   subagent <<'EOF'             — prompt via heredoc (safest for complex prompts)
+#   ...complex prompt...
+#   EOF
+#   echo "prompt" | subagent     — prompt via pipe
+subagent() {
+  local prompt="\${1:-}"
+  if [[ -z "$prompt" && ! -t 0 ]]; then
+    prompt=\$(cat)
+  fi
+  if [[ -z "$prompt" ]]; then echo "Usage: subagent '<prompt>' or subagent <<'EOF'" >&2; return 2; fi
+  local H="content-type: application/json"
+  local auth_args=()
+  if [[ -n "$OPENCODE_AUTH_HEADER" ]]; then auth_args=(-H "$OPENCODE_AUTH_HEADER"); fi
+  local indent
+  indent=$(_rlm_indent)
+
+  # Build JSON body safely with jq (handles all special chars in prompt)
+  local body
+  body=$(jq -n --arg pid "$OPENCODE_RLM_SESSION" --arg p "$prompt" \\
+    '{parentID: $pid, prompt: $p}')
+
+  # Header
+  local prompt_preview
+  prompt_preview=$(printf '%s' "$prompt" | head -c 80)
+  [[ \${#prompt} -gt 80 ]] && prompt_preview="\${prompt_preview}..."
+  printf '%s┌─ subagent ─────────────────────\\n' "$indent" >&2
+  printf '%s│ %s\\n' "$indent" "$prompt_preview" >&2
+  printf '%s├───────────────────────────────\\n' "$indent" >&2
+
+  # Call streaming endpoint — each line is a JSON event
+  local result=""
+  local had_error=0
+  while IFS= read -r line; do
+    local etype
+    etype=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
+    local etext
+    etext=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null)
+
+    case "$etype" in
+      progress)
+        printf '%s│ %s\\n' "$indent" "$etext" >&2
+        ;;
+      result)
+        result="$etext"
+        ;;
+      error)
+        printf '%s│ [error] %s\\n' "$indent" "$etext" >&2
+        had_error=1
+        ;;
+    esac
+  done < <(curl -sS -N -X POST "$OPENCODE_RLM_URL/session/run" \\
+    -H "$H" "\${auth_args[@]}" \\
+    -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH" \\
+    -d "$body")
+
+  # Footer with output preview
+  printf '%s├─ output ──────────────────────\\n' "$indent" >&2
+  if [[ -n "$result" ]]; then
+    local result_preview
+    result_preview=$(printf '%s' "$result" | head -c 120 | tr '\\n' ' ')
+    [[ \${#result} -gt 120 ]] && result_preview="\${result_preview}..."
+    printf '%s│ %s\\n' "$indent" "$result_preview" >&2
+  else
+    printf '%s│ (no output)\\n' "$indent" >&2
+  fi
+  printf '%s└───────────────────────────────\\n' "$indent" >&2
+
+  if [[ $had_error -eq 1 && -z "$result" ]]; then
+    return 1
+  fi
+  printf '%s' "$result"
+}
+
+subagent_batch() {
+  local json="$1"
+  if [[ -z "$json" ]]; then echo "subagent_batch <json array>" >&2; return 2; fi
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local pids=()
+  local i=0
+  local depth=\${OPENCODE_RLM_DEPTH:-0}
+  local indent
+  indent=$(_rlm_indent)
+
+  local count
+  count=$(printf '%s' "$json" | jq 'length')
+  printf '%s┌─ subagent_batch (%s agents) ──\\n' "$indent" "$count" >&2
+
+  # Increment depth for child subagents
+  export OPENCODE_RLM_DEPTH=$((depth + 1))
+
+  while IFS= read -r prompt; do
+    ( subagent "$prompt" > "$tmpdir/$i.out" 2>"$tmpdir/$i.err" ) &
+    pids+=($!)
+    i=$((i + 1))
+  done < <(printf '%s' "$json" | jq -r '.[]')
+
+  local total=$i
+  for pid in "\${pids[@]}"; do wait "$pid"; done
+
+  # Restore depth
+  export OPENCODE_RLM_DEPTH=$depth
+
+  local succeeded=0
+  local failed=0
+  local out err
+  for ((j=0; j<total; j++)); do
+    printf '%s├─ Agent %d/%d ─────────────────\\n' "$indent" "$((j + 1))" "$total" >&2
+    out=$(cat "$tmpdir/$j.out")
+    err=$(cat "$tmpdir/$j.err")
+    if [[ -n "$out" ]]; then
+      # Show progress from stderr (contains the subagent's box output)
+      if [[ -n "$err" ]]; then
+        printf '%s' "$err" | while IFS= read -r line; do
+          printf '%s│ %s\\n' "$indent" "$line" >&2
+        done
+      fi
+      printf '%s\\n' "$out"
+      succeeded=$((succeeded + 1))
+    elif [[ -n "$err" ]]; then
+      printf '%s│ %s\\n' "$indent" "$err" >&2
+      printf '[error] %s\\n' "$err"
+      failed=$((failed + 1))
+    else
+      printf '%s│ [no output]\\n' "$indent" >&2
+      printf '[no output]\\n'
+      failed=$((failed + 1))
+    fi
+  done
+  printf '%s└─ %d/%d agents completed ──────\\n' "$indent" "$succeeded" "$total" >&2
+  rm -rf "$tmpdir"
+}
+`;
+}
+
+/** Set of session IDs created via the proxy (i.e. child/subagent sessions). */
+const childSessionIds = new Set<string>();
+
+/**
+ * Format a tool call part for streaming display.
+ */
+function formatToolPart(part: any): string | null {
+  const toolState = part.state;
+  const toolName = part.tool ?? "unknown";
+  const status = toolState?.status ?? "running";
+
+  if (status === "running" || status === "pending") {
+    const input = toolState?.input;
+    let detail = "";
+    if (toolName === "bash" && input?.command) {
+      // Strip the sourced functions.sh prefix from display
+      let cmd = input.command.replace(/^source "[^"]*functions\.sh"\n/, "").trim();
+      cmd = cmd.length > 80 ? cmd.slice(0, 80) + "…" : cmd;
+      detail = `: ${cmd}`;
+    } else if (input) {
+      const s = JSON.stringify(input);
+      detail = s.length > 80 ? `: ${s.slice(0, 80)}…` : `: ${s}`;
+    }
+    return `  ⟳ ${toolName}${detail}`;
+  }
+
+  if (status === "completed") {
+    const rawOutput = typeof toolState.output === "string"
+      ? toolState.output
+      : JSON.stringify(toolState.output ?? "");
+    // Truncate output for preview
+    const preview = rawOutput.length > 120 ? rawOutput.slice(0, 120) + "…" : rawOutput;
+    return `  ✓ ${toolName} → ${preview.replace(/\n/g, " ")}`;
+  }
+
+  if (status === "error") {
+    return `  ✗ ${toolName}: ${toolState.error ?? "unknown error"}`;
+  }
+
+  return null;
+}
 
 /**
  * Local proxy server that bridges bash curl calls to the OpenCode SDK client.
- * Needed because the bash scripts can't use the Node SDK directly — they need
- * HTTP endpoints. The proxy handles auth and request formatting.
+ * The key endpoint is POST /session/run which creates a child session,
+ * sends a prompt, polls for completion, and streams tool call progress
+ * as newline-delimited JSON events.
  */
-async function startProxyServer(client: PluginInput["client"]): Promise<string> {
+async function startProxyServer(
+  client: PluginInput["client"],
+): Promise<string> {
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -53,10 +261,149 @@ async function startProxyServer(client: PluginInput["client"]): Promise<string> 
           const body = await req.json();
           const { data, error } = await client.session.create({ body });
           if (error) return Response.json(error, { status: 500 });
+          if (data && (data as any).id) {
+            childSessionIds.add((data as any).id);
+          }
           return Response.json(data);
         }
 
-        // POST /session/:id/prompt_async — send prompt asynchronously
+        // POST /session/run — create session, prompt, stream progress, return result
+        // Body: { parentID, prompt }
+        // Response: newline-delimited JSON events:
+        //   {"type":"progress","text":"..."} — tool call progress (for stderr)
+        //   {"type":"result","text":"..."}   — final assistant message (for stdout)
+        //   {"type":"error","text":"..."}    — error message
+        if (req.method === "POST" && path === "/session/run") {
+          const body = await req.json();
+          const { parentID, prompt } = body;
+
+          // Stream response
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            async start(controller) {
+              const send = (obj: any) => {
+                controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+              };
+
+              try {
+                // 1. Create child session
+                const { data: sess, error: createErr } = await client.session.create({
+                  body: { parentID },
+                });
+                if (createErr || !sess) {
+                  send({ type: "error", text: `Failed to create session: ${JSON.stringify(createErr)}` });
+                  controller.close();
+                  return;
+                }
+                const sid = (sess as any).id;
+                childSessionIds.add(sid);
+
+                // 2. Send prompt async
+                const { error: promptErr } = await client.session.promptAsync({
+                  path: { id: sid },
+                  body: {
+                    parts: [{ type: "text", text: prompt }],
+                    agent: "general",
+                  },
+                });
+                if (promptErr) {
+                  send({ type: "error", text: `Failed to send prompt: ${JSON.stringify(promptErr)}` });
+                  controller.close();
+                  return;
+                }
+
+                // 3. Poll for completion, streaming tool call progress
+                // Race condition fix: after promptAsync returns, the session may still
+                // show "idle" for a brief moment before transitioning to "busy".
+                // We must wait until we've seen "busy" at least once before treating
+                // a non-busy status as completion.
+                let seenParts = new Set<string>();
+                let seenBusy = false;
+                let idleRetries = 0;
+                const MAX_IDLE_RETRIES = 20; // up to 10s waiting for session to start
+                while (true) {
+                  // Check status
+                  const { data: statuses } = await client.session.status();
+                  const status = statuses ? (statuses as any)[sid]?.type ?? "idle" : "idle";
+                  if (status === "busy") {
+                    seenBusy = true;
+                    idleRetries = 0;
+                  } else if (!seenBusy) {
+                    // Haven't seen busy yet — session might not have started processing
+                    idleRetries++;
+                    if (idleRetries >= MAX_IDLE_RETRIES) {
+                      send({ type: "error", text: "Timed out waiting for session to start" });
+                      break;
+                    }
+                    await new Promise((r) => setTimeout(r, 500));
+                    continue;
+                  } else {
+                    // Was busy, now done
+                    break;
+                  }
+
+                  // Fetch messages and stream new tool calls
+                  try {
+                    const { data: msgs } = await client.session.messages({ path: { id: sid } });
+                    if (msgs && Array.isArray(msgs)) {
+                      for (const msg of msgs) {
+                        if (msg.info?.role !== "assistant") continue;
+                        for (const part of msg.parts ?? []) {
+                          if (part.type !== "tool") continue;
+                          const partKey = `${(part as any).id ?? ""}:${(part as any).state?.status ?? ""}`;
+                          if (seenParts.has(partKey)) continue;
+                          seenParts.add(partKey);
+                          const line = formatToolPart(part);
+                          if (line) send({ type: "progress", text: line });
+                        }
+                      }
+                    }
+                  } catch {
+                    // Best-effort progress
+                  }
+
+                  await new Promise((r) => setTimeout(r, 500));
+                }
+
+                // 4. Fetch final result
+                const { data: finalMsgs } = await client.session.messages({ path: { id: sid } });
+                let result = "";
+                if (finalMsgs && Array.isArray(finalMsgs)) {
+                  // Get last assistant message's text
+                  for (let i = finalMsgs.length - 1; i >= 0; i--) {
+                    const msg = finalMsgs[i];
+                    if (msg.info?.role === "assistant") {
+                      const textParts = (msg.parts ?? [])
+                        .filter((p: any) => p.type === "text")
+                        .map((p: any) => p.text ?? "");
+                      result = textParts.join("\n");
+
+                      // Also send final tool call states
+                      for (const part of msg.parts ?? []) {
+                        if (part.type !== "tool") continue;
+                        const line = formatToolPart(part);
+                        if (line) send({ type: "progress", text: line });
+                      }
+                      break;
+                    }
+                  }
+                }
+
+                send({ type: "result", text: result || "(no response)" });
+              } catch (e: any) {
+                send({ type: "error", text: e.message ?? String(e) });
+              }
+
+              controller.close();
+            },
+          });
+
+          return new Response(stream, {
+            headers: { "content-type": "application/x-ndjson" },
+          });
+        }
+
+        // POST /session/:id/prompt_async
         const promptAsyncMatch = path.match(/^\/session\/([^/]+)\/prompt_async$/);
         if (req.method === "POST" && promptAsyncMatch) {
           const id = promptAsyncMatch[1];
@@ -66,14 +413,14 @@ async function startProxyServer(client: PluginInput["client"]): Promise<string> 
           return new Response(null, { status: 204 });
         }
 
-        // GET /session/status — get all session statuses
+        // GET /session/status
         if (req.method === "GET" && path === "/session/status") {
           const { data, error } = await client.session.status();
           if (error) return Response.json(error, { status: 500 });
           return Response.json(data);
         }
 
-        // GET /session/:id/message — get session messages
+        // GET /session/:id/message
         const messagesMatch = path.match(/^\/session\/([^/]+)\/message$/);
         if (req.method === "GET" && messagesMatch) {
           const id = messagesMatch[1];
@@ -94,11 +441,33 @@ async function startProxyServer(client: PluginInput["client"]): Promise<string> 
 
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
-
   const directory = ctx.directory;
 
-  // Start proxy server for subagent bash scripts
+  const log = async (msg: string) => {
+    await ctx.client.app.log({
+      body: { service: "opencode-rlm", level: "info", message: msg },
+    });
+  };
+
+  // Auth header for proxy (same as snimu)
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+  const authHeader = password
+    ? `authorization: Basic ${btoa(`${username}:${password}`)}`
+    : "";
+
+  // Start proxy server for subagent bash functions
   const proxyUrl = await startProxyServer(ctx.client);
+
+  // Write bash functions to a file; source it in tool.execute.before (snimu pattern)
+  const rlmDir = join(tmpdir(), "opencode-rlm");
+  mkdirSync(rlmDir, { recursive: true });
+  const functionsPath = join(rlmDir, "functions.sh");
+  const sessionIdPath = join(rlmDir, "session_id");
+  const llmCliPath = join(import.meta.dir, "llm-cli.ts");
+  writeFileSync(functionsPath, buildBashFunctionsScript(sessionIdPath, llmCliPath), { mode: 0o755 });
+
+  const maxOutput = parseInt(process.env.OPENCODE_RLM_MAX_OUTPUT ?? "8192", 10);
 
   await ctx.client.app.log({
     body: {
@@ -118,7 +487,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           ? process.env[provider.info.env[0]]
           : undefined) ||
         "";
-      lastModelInfo = { providerID: model.providerID, modelID: model.id }; // DEBUG: /compact
       writeFileSync(
         llmContextPath,
         JSON.stringify({
@@ -133,7 +501,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
     config: async (cfg: any) => {
       // Disable tools that have bash equivalents — forces the LM through bash
       cfg.tools = cfg.tools ?? {};
-      for (const tool of [
+      for (const disabledTool of [
         "read",        // cat, head, tail
         "glob",        // find, ls, shell globs
         "grep",        // grep, rg
@@ -142,9 +510,9 @@ export const RLMPlugin: Plugin = async (ctx) => {
         "webfetch",    // curl
         "codesearch",  // grep, rg
         "apply_patch", // patch, git apply
-        "task",        // subagent, subagent_batch
+        "task",        // use bash subagent instead
       ]) {
-        cfg.tools[tool] = false;
+        cfg.tools[disabledTool] = false;
       }
 
       if (!cfg.command) cfg.command = {};
@@ -152,18 +520,19 @@ export const RLMPlugin: Plugin = async (ctx) => {
         template: "Display the RLM context status below",
         description: "Show RLM context and trajectory status",
       };
-      // DEBUG: /compact command — remove this block to disable
-      cfg.command.compact = {
-        template: "Trigger compaction now",
-        description: "[debug] Force session compaction immediately",
-      };
-      // END DEBUG
     },
 
     event: async ({ event }) => {
       try {
         if (event.type === "session.created") {
           const sessionId = event.properties.info.id;
+
+          // Skip child sessions (created by subagent via proxy) — they don't need
+          // trajectory tracking, directories, or compaction handling.
+          // This matches snimu's behavior where only root sessions are tracked.
+          if (childSessionIds.has(sessionId)) {
+            return;
+          }
 
           await handleSessionCreated(sessionId, config, sessionStates);
           await ctx.client.app.log({
@@ -180,6 +549,8 @@ export const RLMPlugin: Plugin = async (ctx) => {
 
         if (event.type === "session.idle") {
           const sessionId = event.properties.sessionID;
+          // Skip child sessions (not in sessionStates since we skipped session.created)
+          if (!sessionStates.has(sessionId)) return;
           await handleSessionIdle(
             sessionId,
             config,
@@ -192,9 +563,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           const sessionId = event.properties.sessionID;
           const state = sessionStates.get(sessionId);
           if (state) {
-            // Fetch messages to find the compaction summary.
-            // After compaction, the latest assistant message with summary=true
-            // contains the continuation summary.
             const resp = await ctx.client.session.messages({
               path: { id: sessionId },
             });
@@ -206,7 +574,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
                 msg.info.role === "assistant" &&
                 (msg.info as any).summary === true
               ) {
-                // Extract text from the summary message's parts
                 const textParts = msg.parts
                   .filter((p) => p.type === "text")
                   .map((p) => (p as any).text ?? "");
@@ -238,6 +605,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
 
         if (event.type === "session.deleted") {
           const sessionId = event.properties.info.id;
+          childSessionIds.delete(sessionId); // cleanup tracking
           const state = sessionStates.get(sessionId);
           if (state) {
             await enqueueWrite(state, () =>
@@ -262,65 +630,10 @@ export const RLMPlugin: Plugin = async (ctx) => {
     },
 
     "command.execute.before": async (input, output) => {
-      // DEBUG: /compact command — remove this block to disable
-      if (input.command === "compact") {
-        const state = sessionStates.get(input.sessionID);
-        if (!state) {
-          await ctx.client.session.prompt({
-            path: { id: input.sessionID },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: "[compact] No active RLM session found." }],
-            },
-          });
-          throw new Error("__rlm_compact_handled__");
-        }
-        if (!lastModelInfo) {
-          await ctx.client.session.prompt({
-            path: { id: input.sessionID },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: "[compact] No model info available yet. Send a message first, then retry." }],
-            },
-          });
-          throw new Error("__rlm_compact_handled__");
-        }
-
-        await ctx.client.session.prompt({
-          path: { id: input.sessionID },
-          body: {
-            noReply: true,
-            parts: [{ type: "text", text: "[compact] Triggering compaction..." }],
-          },
-        });
-
-        try {
-          await ctx.client.session.summarize({
-            path: { id: input.sessionID },
-            body: {
-              providerID: lastModelInfo.providerID,
-              modelID: lastModelInfo.modelID,
-            },
-          });
-        } catch (err: any) {
-          await ctx.client.session.prompt({
-            path: { id: input.sessionID },
-            body: {
-              noReply: true,
-              parts: [{ type: "text", text: `[compact] Error: ${err.message}` }],
-            },
-          });
-        }
-
-        throw new Error("__rlm_compact_handled__");
-      }
-      // END DEBUG
-
       if (input.command === "context") {
         const state = sessionStates.get(input.sessionID);
         if (!state) return;
 
-        // Fetch real token usage from the most recent assistant message.
         let modelInputTokens: number | undefined;
         let contextLimit: number | undefined;
         try {
@@ -339,7 +652,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           /* best-effort */
         }
 
-        // Fetch model context limit.
         try {
           const providers = await ctx.client.config.providers({});
           const providerList = (providers.data as any)?.providers ?? [];
@@ -361,7 +673,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           contextLimit,
         });
 
-        // Display directly as a message, no LLM call.
         await ctx.client.session.prompt({
           path: { id: input.sessionID },
           body: {
@@ -394,9 +705,9 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `### Bash commands (available in every bash invocation)`,
           ``,
           `  subagent '<prompt>'`,
-          `    Spawn a full OpenCode child session with tool access. The child session`,
-          `    is visible in the TUI via Ctrl-X. Use this to delegate multi-step subtasks,`,
-          `    fan out work, or tackle problems that need their own context.`,
+          `    Spawn a full OpenCode child session with tool access.`,
+          `    Tool calls and progress are streamed to stderr during execution.`,
+          `    The final result is returned on stdout.`,
           ``,
           `  subagent_batch '<json array of prompts>'`,
           `    Run multiple subagent sessions in parallel. Each prompt gets its own child session.`,
@@ -409,18 +720,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `  list_tools`,
           `    List available tool IDs via the server API.`,
           ``,
-          `### Example: subagent with vars/ persistence`,
-          ``,
-          `\`\`\`bash`,
-          `# 1. Delegate analysis to a subagent and save the output`,
-          `REVIEW=$(subagent "Review src/auth.ts for security issues. List each issue on its own line.")`,
-          `echo "$REVIEW" > ${state.varsDir}/auth-review.txt`,
-          ``,
-          `# 2. In a later bash call, read it back and use it`,
-          `REVIEW=$(cat ${state.varsDir}/auth-review.txt)`,
-          `subagent "Given these security issues:\\n$REVIEW\\nPropose fixes for each one."`,
-          `\`\`\``,
-          ``,
           `### Example: fan-out with subagent_batch`,
           ``,
           `\`\`\`bash`,
@@ -428,9 +727,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `PROMPTS=$(echo "$FILES" | jq -R -s 'split("\\n") | map(select(length > 0)) | map("Analyze " + . + " for bugs")')`,
           `RESULTS=$(subagent_batch "$PROMPTS")`,
           `echo "$RESULTS" > ${state.varsDir}/analysis.txt`,
-          ``,
-          `# Chain into a follow-up subagent`,
-          `subagent "Based on the analysis in ${state.varsDir}/analysis.txt, write a summary report"`,
           `\`\`\``,
           ``,
           `### Workflow guidance`,
@@ -491,18 +787,17 @@ export const RLMPlugin: Plugin = async (ctx) => {
 
     "shell.env": async (_input: any, output: any) => {
       output.env.RLM_LLM_CONTEXT = llmContextPath;
-      output.env.PATH = `${binDir}:${process.env.PATH}`;
-      // Proxy URL for subagent and list_tools bash helpers
+      // Proxy URL and directory for subagent bash functions
       output.env.OPENCODE_RLM_URL = proxyUrl;
       output.env.OPENCODE_RLM_DIR_PATH = directory;
-      // Session ID file — written by tool.execute.before, read by bin/subagent
-      output.env.OPENCODE_RLM_SESSION_ID_FILE = sessionIdPath;
+      output.env.OPENCODE_AUTH_HEADER = authHeader;
     },
 
     "tool.execute.before": async (input, output) => {
-      // Write current session ID so bin/subagent can create child sessions
-      if (input.tool === "bash") {
+      // Source bash functions into every bash command (snimu pattern)
+      if (input.tool === "bash" && output.args?.command) {
         writeFileSync(sessionIdPath, input.sessionID);
+        output.args.command = `source "${functionsPath}"\n` + output.args.command;
       }
 
       if (input.tool === "write" || input.tool === "edit") {
@@ -531,6 +826,12 @@ export const RLMPlugin: Plugin = async (ctx) => {
             `RLM mode is enabled. Other tools (read, write, edit, glob, grep, etc.) are disabled.`,
             `You MUST use this bash tool for all operations.`,
             ``,
+            `Additional bash helpers:`,
+            `- subagent '<prompt>' — spawn a child session with tool access (streams progress)`,
+            `- subagent_batch '<json array>' — run multiple child sessions in parallel`,
+            `- llm-subcall "prompt" — single LLM call (fast, no tools)`,
+            `- list_tools — list available tool IDs`,
+            ``,
             `Bash equivalents for disabled tools:`,
             `- read → cat, head, tail`,
             `- write → heredocs, tee, cat >`,
@@ -538,12 +839,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
             `- glob → find, ls, shell globs`,
             `- grep → grep, rg`,
             `- webfetch → curl`,
-            ``,
-            `Available commands:`,
-            `- subagent '<prompt>' — spawn a child session with full tool access (visible in Ctrl-X)`,
-            `- subagent_batch '<json array>' — run multiple subagent sessions in parallel`,
-            `- llm-subcall "prompt" — single LLM call (fast, no tools)`,
-            `- list_tools — list available tool IDs`,
             ``,
             `Pass JSON as single-quoted strings. Each call is a fresh process — persist`,
             `state via files (e.g. vars/ directory).`,
@@ -555,20 +850,21 @@ export const RLMPlugin: Plugin = async (ctx) => {
       if (input.tool !== "bash") return;
       const cmd = input.args?.command ?? "";
 
-      const isBatch = cmd.includes("subagent_batch");
-      const isSingle =
-        cmd.includes("subagent ") && !cmd.includes("subagent_batch");
+      // Set descriptive title for subagent calls
+      if (cmd.includes("subagent_batch")) {
+        output.title = "subagent_batch";
+      } else if (cmd.includes("subagent ") && !cmd.includes("subagent_batch")) {
+        output.title = "subagent";
+      }
 
-      if (isBatch) {
-        const fmt = formatSubagentBatch(cmd, output.output || "");
-        output.title = fmt.title;
-        output.output = fmt.summary;
-        if (output.metadata) output.metadata.output = fmt.summary;
-      } else if (isSingle) {
-        const fmt = formatSubagent(cmd, output.output || "");
-        output.title = fmt.title;
-        output.output = fmt.summary;
-        if (output.metadata) output.metadata.output = fmt.summary;
+      // Truncate long output
+      if (maxOutput > 0 && output.output && output.output.length > maxOutput) {
+        const half = Math.floor(maxOutput / 2);
+        const trimmed = output.output.length - maxOutput;
+        output.output =
+          output.output.slice(0, half) +
+          `\n\n... [${trimmed} characters truncated] ...\n\n` +
+          output.output.slice(-half);
       }
     },
   };

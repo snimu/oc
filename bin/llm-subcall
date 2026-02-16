@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-# Wrapper that runs the llm-subcall TypeScript CLI via Bun.
-# This file is added to PATH by the RLM plugin's shell.env hook.
-exec bun "$(dirname "$0")/../src/llm-cli.ts" "$@"

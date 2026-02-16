@@ -270,8 +270,3 @@ Register in `opencode.json` (project root) or `~/.config/opencode/opencode.json`
 | `RLM_MAX_TOOL_OUTPUT_CHARS` | `50000` | Max chars to store per tool result in trajectory |
 | `RLM_TOKEN_ESTIMATE_MULTIPLIER` | `1.0` | Tuning multiplier for token estimation |
 
-## Debug: `/compact` command
-
-A temporary `/compact` command is available for testing compaction and summarization. Running `/compact` in OpenCode triggers compaction immediately via the `session.summarize` API, without waiting for the context window to fill up.
-
-**To disable:** search `src/index.ts` for `// DEBUG: /compact` and remove every block between `// DEBUG` and `// END DEBUG` markers (3 blocks total, plus the `lastModelInfo` assignment on the `chat.params` line). There are no other files to change.

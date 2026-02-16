@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Query the OpenCode server for available tool IDs.
-# Talks to the local proxy server started by the plugin.
-
-curl -sS "$OPENCODE_RLM_URL/experimental/tool/ids" \
-  -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH"

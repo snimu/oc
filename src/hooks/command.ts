@@ -68,10 +68,19 @@ export async function buildContextDisplay(
   const summaries = getRecentSummaries(doc, 3);
 
   const activeTurns = active?.turns.length ?? 0;
-  const activeTokens = active?.totalEstimatedTokens ?? 0;
-  const compactedTokens = doc.stats.totalTokensProcessed - activeTokens;
-  const totalProcessed = doc.stats.totalTokensProcessed;
+  const activeEstimatedTokens = active?.totalEstimatedTokens ?? 0;
   const compactions = doc.stats.totalCompactions;
+
+  // Compacted tokens = sum of all non-active segment estimates
+  const compactedEstimatedTokens = doc.stats.totalTokensProcessed - activeEstimatedTokens;
+
+  // Use actual model tokens for root context when available, otherwise fall back to estimate
+  const rootTokens = opts.modelInputTokens ?? activeEstimatedTokens;
+  const rootIsActual = opts.modelInputTokens != null;
+
+  // Total = root context + compacted history estimates
+  // This ensures total >= root always
+  const totalTokens = rootTokens + compactedEstimatedTokens;
 
   const varsEntries: Array<{ name: string; size: number; path: string }> = [];
   try {
@@ -92,16 +101,16 @@ export async function buildContextDisplay(
   L.push("");
 
   L.push("Root Model Context");
-  if (opts.modelInputTokens != null) {
-    let line = `${fmt(opts.modelInputTokens)} input tokens`;
+  if (rootIsActual) {
+    let line = `${fmt(rootTokens)} input tokens`;
     if (opts.contextLimit) {
-      line += ` / ${fmt(opts.contextLimit)} limit (${pct(opts.modelInputTokens, opts.contextLimit)})`;
+      line += ` / ${fmt(opts.contextLimit)} limit (${pct(rootTokens, opts.contextLimit)})`;
     }
     L.push(indent(line));
   } else {
-    L.push(indent(`~${fmt(activeTokens)} tokens (estimated)`));
+    L.push(indent(`~${fmt(rootTokens)} tokens (estimated — send a message for actual count)`));
   }
-  let turnsLine = `${fmt(activeTurns)} turns`;
+  let turnsLine = `${fmt(activeTurns)} turns in current segment`;
   if (active?.startedAt) {
     turnsLine += `, started ${timeAgo(active.startedAt)}`;
   }
@@ -109,10 +118,10 @@ export async function buildContextDisplay(
   L.push("");
 
   L.push("Total RLM Context");
-  L.push(indent(`${fmt(totalProcessed)} tokens total, ${doc.stats.totalTurns} turns`));
+  L.push(indent(`~${fmt(totalTokens)} tokens total, ${doc.stats.totalTurns} turns`));
   if (compactions > 0) {
-    L.push(indent(`${fmt(compactedTokens)} compacted (${pct(compactedTokens, totalProcessed || 1)}), ${compactions} compaction${compactions === 1 ? "" : "s"}`));
-    L.push(indent(`${fmt(activeTokens)} active (${pct(activeTokens, totalProcessed || 1)})`));
+    L.push(indent(`~${fmt(compactedEstimatedTokens)} compacted, ${compactions} compaction${compactions === 1 ? "" : "s"}`));
+    L.push(indent(`${rootIsActual ? "" : "~"}${fmt(rootTokens)} active (current segment)`));
   }
   L.push("");
 
@@ -167,8 +176,8 @@ export async function buildContextDisplay(
   L.push("");
 
   L.push("Bash Commands");
-  L.push(indent(`subagent '<prompt>'          — child session with tools (Ctrl-X to view)`));
-  L.push(indent(`subagent_batch '<json>'      — parallel subagent sessions`));
+  L.push(indent(`subagent '<prompt>'          — child session (streams tool calls)`));
+  L.push(indent(`subagent_batch '<json>'      — parallel child sessions`));
   L.push(indent(`llm-subcall "prompt"         — single LLM call (no tools, fast)`));
   L.push(indent(`list_tools                   — list available tool IDs`));
   L.push("");

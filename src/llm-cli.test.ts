@@ -3,7 +3,8 @@ import { existsSync } from "fs";
 import { join } from "path";
 
 const llmContextPath = "/tmp/rlm-llm-context.json";
-const binScript = join(import.meta.dir, "..", "bin", "llm-subcall");
+const cliScript = join(import.meta.dir, "llm-cli.ts");
+const binScript = ["bun", cliScript];
 
 const hasContext = existsSync(llmContextPath);
 
@@ -11,7 +12,7 @@ describe.skipIf(!hasContext)("llm-subcall", () => {
   test(
     "returns a non-empty response for a simple prompt",
     async () => {
-      const proc = Bun.spawn([binScript, 'Reply with exactly "hello"'], {
+      const proc = Bun.spawn([...binScript, 'Reply with exactly "hello"'], {
         env: { ...process.env, RLM_LLM_CONTEXT: llmContextPath },
         stdout: "pipe",
         stderr: "pipe",
@@ -34,7 +35,7 @@ describe.skipIf(!hasContext)("llm-subcall", () => {
     async () => {
       const proc = Bun.spawn(
         [
-          binScript,
+          ...binScript,
           "--system",
           "You only respond with a single number, nothing else.",
           "What is 2+2?",
@@ -58,7 +59,7 @@ describe.skipIf(!hasContext)("llm-subcall", () => {
   );
 
   test("fails with a clear error when no prompt is given", async () => {
-    const proc = Bun.spawn([binScript], {
+    const proc = Bun.spawn([...binScript], {
       env: { ...process.env, RLM_LLM_CONTEXT: llmContextPath },
       stdout: "pipe",
       stderr: "pipe",
@@ -77,7 +78,7 @@ describe("llm-subcall without context", () => {
     const env = { ...process.env };
     delete env.RLM_LLM_CONTEXT;
 
-    const proc = Bun.spawn([binScript, "hello"], {
+    const proc = Bun.spawn([...binScript, "hello"], {
       env,
       stdout: "pipe",
       stderr: "pipe",
