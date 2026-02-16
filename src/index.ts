@@ -9,14 +9,13 @@ import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
 import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
-import { tmpdir } from "os";
 import {
   recordCompaction,
   enqueueWrite,
   writeTrajectory,
 } from "./trajectory/manager";
 
-const llmContextPath = "/tmp/rlm-llm-context.json";
+const llmContextPath = "/tmp/rlm/llm-context.json";
 
 /**
  * Generate the bash functions script that gets sourced into every bash invocation.
@@ -155,7 +154,8 @@ subagent_batch() {
   local json="$1"
   if [[ -z "$json" ]]; then echo "subagent_batch <json array>" >&2; return 2; fi
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpdir="/tmp/rlm/batch-$$-$RANDOM"
+  mkdir -p "$tmpdir"
   local pids=()
   local i=0
   local depth=\${OPENCODE_RLM_DEPTH:-0}
@@ -513,21 +513,28 @@ export const RLMPlugin: Plugin = async (ctx) => {
   // Start proxy server for subagent bash functions
   const proxyUrl = await startProxyServer(ctx.client);
 
-  // Write bash functions to a file; source it in tool.execute.before (snimu pattern)
-  const rlmDir = join(tmpdir(), "opencode-rlm");
+  // Initialize /tmp/rlm/ directory up front so the user grants permission once.
+  // All RLM data lives here: session dirs, functions, LLM context, batch files.
+  const rlmDir = "/tmp/rlm";
   mkdirSync(rlmDir, { recursive: true });
   const functionsPath = join(rlmDir, "functions.sh");
   const sessionIdPath = join(rlmDir, "session_id");
   const llmCliPath = join(import.meta.dir, "llm-cli.ts");
   writeFileSync(functionsPath, buildBashFunctionsScript(sessionIdPath, llmCliPath), { mode: 0o755 });
+  // Write an initial placeholder so the LLM context file exists from the start
+  writeFileSync(llmContextPath, JSON.stringify({}));
 
   const maxOutput = parseInt(process.env.OPENCODE_RLM_MAX_OUTPUT ?? "8192", 10);
 
   await ctx.client.app.log({
     body: {
       service: "opencode-rlm",
-      level: "info",
-      message: `RLM plugin loaded (baseDir=${config.baseDir}, proxy=${proxyUrl})`,
+      level: "warn",
+      message: [
+        `RLM plugin active — using /tmp/rlm/ for all read/write operations`,
+        `(session data, trajectories, scratch space, subagent state).`,
+        `baseDir=${config.baseDir}, proxy=${proxyUrl}`,
+      ].join(" "),
     },
   });
 
@@ -567,6 +574,17 @@ export const RLMPlugin: Plugin = async (ctx) => {
         "task",        // use bash subagent instead
       ]) {
         cfg.tools[disabledTool] = false;
+      }
+
+      // Pre-authorize bash access to /tmp/rlm/ so the user isn't prompted
+      // for every subagent, llm-subcall, or scratch file operation.
+      // All RLM data (sessions, trajectories, vars, functions, batches) lives here.
+      cfg.permission = cfg.permission ?? {};
+      if (typeof cfg.permission !== "string") {
+        cfg.permission.bash = cfg.permission.bash ?? {};
+        if (typeof cfg.permission.bash !== "string") {
+          cfg.permission.bash["/tmp/rlm/**"] = "allow";
+        }
       }
 
       if (!cfg.command) cfg.command = {};
@@ -756,6 +774,29 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `- **Web fetching**: curl`,
           `- **Subagents**: subagent, subagent_batch (see below)`,
           ``,
+          `### Directory layout`,
+          ``,
+          `All RLM data lives under \`/tmp/rlm/\` (pre-authorized, no permission prompts):`,
+          ``,
+          `\`\`\``,
+          `/tmp/rlm/`,
+          `  session-<hash>/          ← per-session directory`,
+          `    active/`,
+          `      trajectory.json      ← full conversation log (READ-ONLY)`,
+          `    vars/                   ← your scratch space (read/write)`,
+          `  functions.sh             ← sourced bash helpers`,
+          `  llm-context.json         ← model/provider config`,
+          `  session_id               ← current session ID`,
+          `  batch-*/                  ← subagent_batch temp files`,
+          `\`\`\``,
+          ``,
+          `- **Trajectory** (read-only): \`${state.trajectoryPath}\``,
+          `- **Scratch/vars** (read-write): \`${state.varsDir}\``,
+          `- **Session dir**: \`${state.sessionDir}\``,
+          ``,
+          `Use \`/tmp/rlm/\` for all temp files — it is pre-authorized and won't trigger permission prompts.`,
+          `Do NOT write to \`active/\` — it is managed by the scaffold. Use \`vars/\` instead.`,
+          ``,
           `### Bash commands (available in every bash invocation)`,
           ``,
           `  subagent '<prompt>'`,
@@ -804,6 +845,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `- For process substitution \`<(...)\`, prefer piping instead: \`cmd | while read ...\`.`,
           `- For string replacement: \`echo "$var" | sed 's/old/new/g'\` instead of \`\${var//old/new}\`.`,
           `- Test scripts with \`zsh -n script.sh\` before running if complex.`,
+          `- Use \`/tmp/rlm/\` for all temp files (pre-authorized, no permission prompts).`,
           ``,
           `### Workflow guidance`,
           ``,
@@ -812,7 +854,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `- For independent subtasks, prefer subagent_batch to run them concurrently.`,
           `- For quick LLM queries without tool access, use llm-subcall.`,
           `- Each bash call is a fresh process — variables do not persist between calls.`,
-          `  To carry state across calls, write to files (e.g. vars/ directory) and read them back.`,
+          `  To carry state across calls, write to files in \`${state.varsDir}\` and read them back.`,
           `- **IMPORTANT**: For complex prompts with quotes, braces, backslashes, or JSON, ALWAYS use heredoc syntax:`,
           `  \`\`\`bash`,
           `  subagent <<'EOF'`,
@@ -821,13 +863,14 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `  \`\`\``,
           `  This prevents all shell parsing issues. Only use single-quoted args for short, simple prompts.`,
           `- Pass JSON arguments as single-quoted strings to preserve spaces.`,
+          `- Store all temp files under \`/tmp/rlm/\` — never use \`/tmp/\` directly (avoids permission prompts).`,
           ``,
           `### Trajectory and scratch space`,
           ``,
-          `Your full conversation trajectory is logged at: ${state.trajectoryPath}`,
+          `Your full conversation trajectory is logged at: \`${state.trajectoryPath}\``,
           `Read this file to recall past work after context compaction. It is append-only — do not write to it.`,
           ``,
-          `You have a persistent scratch directory at: ${state.varsDir}`,
+          `Your persistent scratch directory is: \`${state.varsDir}\``,
           `Use it to store plans, notes, intermediate results, or anything that should survive compaction.`,
           `Prefer structured formats (JSON) so future reads are cheap.`,
           ``,

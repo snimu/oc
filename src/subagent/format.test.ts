@@ -245,8 +245,8 @@ describe("formatSubagentBatch", () => {
     const rawOutput = [
       'export OPENCODE_RLM_SESSION="sess-123"',
       "export OPENCODE_RLM_DEPTH=0",
-      'export BASH_ENV="/tmp/opencode-rlm/functions.sh"',
-      'source "/tmp/opencode-rlm/functions.sh"',
+      'export BASH_ENV="/tmp/rlm/functions.sh"',
+      'source "/tmp/rlm/functions.sh"',
       "export PATH=/tmp/stubs:/usr/bin",
       "",
       "Analysis of src/auth.ts:",

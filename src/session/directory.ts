@@ -12,7 +12,7 @@ export async function createSessionDirectory(
   baseDir: string,
 ): Promise<SessionDirs> {
   const hash = randomUUID().replace(/-/g, "").slice(0, 8);
-  const sessionDir = `${baseDir}/rlm-opencode-${hash}`;
+  const sessionDir = `${baseDir}/session-${hash}`;
   const activeDir = `${sessionDir}/active`;
   const varsDir = `${sessionDir}/vars`;
   const trajectoryPath = `${activeDir}/trajectory.json`;

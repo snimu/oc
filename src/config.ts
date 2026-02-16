@@ -1,7 +1,7 @@
 import type { RLMConfig } from "./types";
 
 const DEFAULT_CONFIG: RLMConfig = {
-  baseDir: "/tmp",
+  baseDir: "/tmp/rlm",
   cleanupOnDelete: false,
   maxToolOutputChars: 50000,
   tokenEstimateMultiplier: 1.0,
