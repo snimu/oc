@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Query the OpenCode server for available tool IDs.
+
+auth_args=()
+if [[ -n "$OPENCODE_AUTH_HEADER" ]]; then auth_args=(-H "$OPENCODE_AUTH_HEADER"); fi
+curl -sS "$OPENCODE_RLM_URL/experimental/tool/ids" \
+  "${auth_args[@]}" \
+  -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH"

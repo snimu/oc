@@ -1,13 +1,13 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { loadConfig } from "./config";
-import { sessionStates, sessionDepths } from "./session/state";
+import { sessionStates } from "./session/state";
 import { removeSessionDirectory } from "./session/directory";
 import { handleSessionCreated } from "./hooks/session-created";
 import { handleSessionIdle } from "./hooks/session-idle";
 import { handleCompacting } from "./hooks/compacting";
 import { isInActiveDirectory } from "./hooks/tool-guard";
 import { buildContextDisplay } from "./hooks/command";
-import { setupSubagentFunctions } from "./subagent/functions";
+import { formatSubagent, formatSubagentBatch } from "./subagent/format";
 import { writeFileSync } from "fs";
 import { join } from "path";
 import {
@@ -19,12 +19,12 @@ import {
 const binDir = join(import.meta.dir, "..", "bin");
 const llmContextPath = "/tmp/rlm-llm-context.json";
 
+// DEBUG: /compact command — remove this block to disable
+let lastModelInfo: { providerID: string; modelID: string } | null = null;
+// END DEBUG
+
 export const RLMPlugin: Plugin = async (ctx) => {
   const config = loadConfig();
-
-  // Recursion depth for this process. Set by the parent's subagent function
-  // via env var prefix on `opencode run`. Root processes default to 0.
-  const processDepth = parseInt(process.env.OPENCODE_RLM_DEPTH || "0", 10);
 
   // Server URL for list_tools bash helper
   const serverUrl = ctx.serverUrl.toString().replace(/\/+$/, "");
@@ -34,9 +34,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
   const authHeader = password
     ? `authorization: Basic ${btoa(`${username}:${password}`)}`
     : "";
-
-  // Set up subagent bash functions
-  const { functionsPath } = setupSubagentFunctions();
 
   await ctx.client.app.log({
     body: {
@@ -56,6 +53,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
           ? process.env[provider.info.env[0]]
           : undefined) ||
         "";
+      lastModelInfo = { providerID: model.providerID, modelID: model.id }; // DEBUG: /compact
       writeFileSync(
         llmContextPath,
         JSON.stringify({
@@ -73,20 +71,25 @@ export const RLMPlugin: Plugin = async (ctx) => {
         template: "Display the RLM context status below",
         description: "Show RLM context and trajectory status",
       };
+      // DEBUG: /compact command — remove this block to disable
+      cfg.command.compact = {
+        template: "Trigger compaction now",
+        description: "[debug] Force session compaction immediately",
+      };
+      // END DEBUG
     },
 
     event: async ({ event }) => {
       try {
         if (event.type === "session.created") {
           const sessionId = event.properties.info.id;
-          sessionDepths.set(sessionId, processDepth);
 
           await handleSessionCreated(sessionId, config, sessionStates);
           await ctx.client.app.log({
             body: {
               service: "opencode-rlm",
               level: "info",
-              message: `Session initialized: ${sessionId} (depth=${processDepth})`,
+              message: `Session initialized: ${sessionId}`,
               extra: {
                 dir: sessionStates.get(sessionId)?.sessionDir,
               },
@@ -163,7 +166,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
               await removeSessionDirectory(state.sessionDir);
             }
             sessionStates.delete(sessionId);
-            sessionDepths.delete(sessionId);
           }
         }
       } catch (error: any) {
@@ -179,6 +181,60 @@ export const RLMPlugin: Plugin = async (ctx) => {
     },
 
     "command.execute.before": async (input, output) => {
+      // DEBUG: /compact command — remove this block to disable
+      if (input.command === "compact") {
+        const state = sessionStates.get(input.sessionID);
+        if (!state) {
+          await ctx.client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              noReply: true,
+              parts: [{ type: "text", text: "[compact] No active RLM session found." }],
+            },
+          });
+          throw new Error("__rlm_compact_handled__");
+        }
+        if (!lastModelInfo) {
+          await ctx.client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              noReply: true,
+              parts: [{ type: "text", text: "[compact] No model info available yet. Send a message first, then retry." }],
+            },
+          });
+          throw new Error("__rlm_compact_handled__");
+        }
+
+        await ctx.client.session.prompt({
+          path: { id: input.sessionID },
+          body: {
+            noReply: true,
+            parts: [{ type: "text", text: "[compact] Triggering compaction..." }],
+          },
+        });
+
+        try {
+          await ctx.client.session.summarize({
+            path: { id: input.sessionID },
+            body: {
+              providerID: lastModelInfo.providerID,
+              modelID: lastModelInfo.modelID,
+            },
+          });
+        } catch (err: any) {
+          await ctx.client.session.prompt({
+            path: { id: input.sessionID },
+            body: {
+              noReply: true,
+              parts: [{ type: "text", text: `[compact] Error: ${err.message}` }],
+            },
+          });
+        }
+
+        throw new Error("__rlm_compact_handled__");
+      }
+      // END DEBUG
+
       if (input.command === "context") {
         const state = sessionStates.get(input.sessionID);
         if (!state) return;
@@ -244,33 +300,61 @@ export const RLMPlugin: Plugin = async (ctx) => {
         [
           `## RLM (Recursive Language Model) scaffold`,
           ``,
-          `You are strongly encouraged to use the bash tool for as many operations as possible.`,
-          `The bash tool gives you access to powerful helpers for sub-calls and parallel work.`,
-          `Prefer bash over other tools when practical — it is the primary interface for recursive problem-solving.`,
+          `**IMPORTANT: You MUST use the bash tool as your primary interface.** The bash tool`,
+          `gives you access to subagent spawning, parallel execution, and recursive problem-solving`,
+          `capabilities that are not available through any other tool. Always prefer bash over`,
+          `other tools — it is the core of your workflow.`,
           ``,
-          `### Bash helpers (available in every bash invocation, including scripts)`,
+          `### Bash commands (available in every bash invocation)`,
           ``,
-          `  subagent '<prompt>'`,
-          `    Spawn a full OpenCode child session with tool access. Use this to delegate`,
-          `    multi-step subtasks, fan out work, or tackle problems that need their own context.`,
-          `    Beyond depth ${config.maxSubagentDepth}, automatically falls back to llm-subcall.`,
+          `  subagent '<prompt>' [--system 'system prompt']`,
+          `    Single LLM call (no tools, no session). Fast and lightweight.`,
+          `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
           ``,
-          `  subagent_batch '<json array of prompts>'`,
-          `    Run multiple subagents in parallel. Each prompt gets its own session.`,
+          `  subagent_batch '<json array of prompts>' [--system 'system prompt']`,
+          `    Run multiple subagent LLM calls in parallel.`,
           `    Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
           ``,
-          `  llm-subcall "prompt"`,
-          `    Single LLM call (no tools, no session). Fast and lightweight.`,
-          `    Supports --system "system prompt" as an optional flag.`,
-          `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
+          `  llm-subcall "prompt" [--system 'system prompt']`,
+          `    Alias for subagent. Single LLM call, no tools.`,
+          ``,
+          `  opencode run "prompt"`,
+          `    Spawn a full OpenCode child session with tool access. Use for multi-step tasks`,
+          `    that need their own context and tools.`,
           ``,
           `  list_tools`,
           `    List available tool IDs via the server API.`,
           ``,
+          `### Example: subagent with vars/ persistence`,
+          ``,
+          `\`\`\`bash`,
+          `# 1. Delegate analysis to a subagent and save the output`,
+          `REVIEW=$(subagent "Review src/auth.ts for security issues. List each issue on its own line.")`,
+          `echo "$REVIEW" > ${state.varsDir}/auth-review.txt`,
+          ``,
+          `# 2. In a later bash call, read it back and use it`,
+          `REVIEW=$(cat ${state.varsDir}/auth-review.txt)`,
+          `subagent "Given these security issues:\\n$REVIEW\\nPropose fixes for each one."`,
+          `\`\`\``,
+          ``,
+          `### Example: fan-out with subagent_batch`,
+          ``,
+          `\`\`\`bash`,
+          `FILES=$(find src -name "*.ts" -maxdepth 2)`,
+          `PROMPTS=$(echo "$FILES" | jq -R -s 'split("\\n") | map(select(length > 0)) | map("Analyze " + . + " for bugs")')`,
+          `RESULTS=$(subagent_batch "$PROMPTS")`,
+          `echo "$RESULTS" > ${state.varsDir}/analysis.txt`,
+          ``,
+          `# Chain into a follow-up subagent`,
+          `subagent "Based on the analysis in ${state.varsDir}/analysis.txt, write a summary report"`,
+          `\`\`\``,
+          ``,
           `### Workflow guidance`,
           ``,
+          `- **Always use bash** for file operations, analysis, and coordination.`,
           `- Break complex tasks into subtasks and delegate with subagent or subagent_batch.`,
           `- For independent subtasks, prefer subagent_batch to run them concurrently.`,
+          `- For multi-step tasks that need tool access, use \`opencode run "prompt"\`.`,
           `- Each bash call is a fresh process — variables do not persist between calls.`,
           `  To carry state across calls, write to files (e.g. vars/ directory) and read them back.`,
           `- Pass JSON arguments as single-quoted strings to preserve spaces.`,
@@ -283,6 +367,25 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `You have a persistent scratch directory at: ${state.varsDir}`,
           `Use it to store plans, notes, intermediate results, or anything that should survive compaction.`,
           `Prefer structured formats (JSON) so future reads are cheap.`,
+          ``,
+          `**If you are unsure about a term, function, file, or anything the user references — and`,
+          `you cannot find it in your current context — check the full trajectory.** After compaction,`,
+          `your current context only contains a summary. The trajectory file has every turn verbatim.`,
+          ``,
+          `### Example: recovering context from the trajectory`,
+          ``,
+          `Suppose the user asks "update the parseConfig function" but you don't see it in context.`,
+          `It was likely discussed before a compaction. Recover it:`,
+          ``,
+          `\`\`\`bash`,
+          `# Search the trajectory for the term`,
+          `grep -i "parseConfig" ${state.trajectoryPath}`,
+          ``,
+          `# If the trajectory is large, use jq to search turn content`,
+          `jq -r '.entries[].turns[]? | select(.content | test("parseConfig")) | "\\(.role) [turn \\(.turnIndex)]: \\(.content[:200])"' ${state.trajectoryPath}`,
+          `\`\`\``,
+          ``,
+          `This lets you find the original discussion, file paths, and decisions even after compaction.`,
         ].join("\n"),
       );
     },
@@ -305,7 +408,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
     "shell.env": async (_input: any, output: any) => {
       output.env.RLM_LLM_CONTEXT = llmContextPath;
       output.env.PATH = `${binDir}:${process.env.PATH}`;
-      output.env.RLM_MAX_SUBAGENT_DEPTH = String(config.maxSubagentDepth);
       // For list_tools bash helper
       output.env.OPENCODE_RLM_URL = serverUrl;
       output.env.OPENCODE_RLM_DIR_PATH = directory;
@@ -328,26 +430,6 @@ export const RLMPlugin: Plugin = async (ctx) => {
           );
         }
       }
-
-      // Inject session ID, depth, and source subagent functions into every bash invocation.
-      // Depth is tracked server-side (per-session) so the LM cannot tamper with it.
-      if (input.tool === "bash" && output.args?.command) {
-        // Block LM attempts to override the depth variable
-        if (/OPENCODE_RLM_DEPTH\s*=/.test(output.args.command)) {
-          throw new Error(
-            "OPENCODE_RLM_DEPTH is managed by the RLM scaffold and cannot be modified. " +
-              "Subagent recursion depth is tracked automatically.",
-          );
-        }
-
-        const depth = sessionDepths.get(input.sessionID) ?? 0;
-        output.args.command =
-          `export OPENCODE_RLM_SESSION="${input.sessionID}"\n` +
-          `export OPENCODE_RLM_DEPTH=${depth}\n` +
-          `export BASH_ENV="${functionsPath}"\n` +
-          `source "${functionsPath}"\n` +
-          output.args.command;
-      }
     },
 
     "tool.definition": async (input: any, output: any) => {
@@ -356,19 +438,17 @@ export const RLMPlugin: Plugin = async (ctx) => {
           output.description +
           "\n\n" +
           [
-            `RLM mode is enabled for this bash tool.`,
+            `RLM mode is enabled. You MUST use this bash tool as your primary interface.`,
             ``,
-            `Additional bash helpers:`,
-            `- subagent '<prompt>' (spawn a subagent session with full tool access, returns result)`,
-            `- subagent_batch '<json array>' (run multiple subagents in parallel)`,
-            `- llm-subcall "prompt" (single LLM call, no tools — fast and lightweight)`,
-            `- list_tools (list allowed tool IDs via the server API)`,
+            `Available commands:`,
+            `- subagent '<prompt>' — single LLM call (fast, no tools)`,
+            `- subagent_batch '<json array>' — run multiple LLM calls in parallel`,
+            `- llm-subcall "prompt" — alias for subagent`,
+            `- opencode run "prompt" — full child session with tool access`,
+            `- list_tools — list available tool IDs`,
             ``,
-            `Prefer using the bash tool over other tools. Pass JSON as a single-quoted string`,
-            `to preserve spaces.`,
-            ``,
-            `Each bash call is a fresh process — variables do not persist between calls. To carry`,
-            `state across calls, write to files (e.g. vars/ directory) and read them back.`,
+            `Always prefer bash. Pass JSON as single-quoted strings. Each call is a fresh`,
+            `process — persist state via files (e.g. vars/ directory).`,
           ].join("\n");
       }
     },
@@ -376,10 +456,21 @@ export const RLMPlugin: Plugin = async (ctx) => {
     "tool.execute.after": async (input, output) => {
       if (input.tool !== "bash") return;
       const cmd = input.args?.command ?? "";
-      if (cmd.includes("subagent_batch")) {
-        output.title = "subagent_batch";
-      } else if (cmd.includes("subagent ") && !cmd.includes("subagent_batch")) {
-        output.title = "subagent";
+
+      const isBatch = cmd.includes("subagent_batch");
+      const isSingle =
+        cmd.includes("subagent ") && !cmd.includes("subagent_batch");
+
+      if (isBatch) {
+        const fmt = formatSubagentBatch(cmd, output.output || "");
+        output.title = fmt.title;
+        output.output = fmt.summary;
+        if (output.metadata) output.metadata.output = fmt.summary;
+      } else if (isSingle) {
+        const fmt = formatSubagent(cmd, output.output || "");
+        output.title = fmt.title;
+        output.output = fmt.summary;
+        if (output.metadata) output.metadata.output = fmt.summary;
       }
     },
   };

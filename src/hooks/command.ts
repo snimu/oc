@@ -128,6 +128,30 @@ export async function buildContextDisplay(
     L.push("");
   }
 
+  L.push("Trajectory");
+  L.push(indent(`file: ${state.trajectoryPath}`));
+  L.push(indent(`${doc.entries.length} entries, ${doc.stats.totalTurns} turns, ${doc.stats.totalCompactions} compactions`));
+  // Peek at first and last turns
+  const allTurns: Array<{ role: string; content: string; timestamp: string }> = [];
+  for (const entry of doc.entries) {
+    if (entry.type === "segment") {
+      for (const t of entry.turns) allTurns.push(t);
+    }
+  }
+  if (allTurns.length > 0) {
+    const first = allTurns[0];
+    const last = allTurns[allTurns.length - 1];
+    const clip = (s: string, n: number) =>
+      s.length > n ? s.slice(0, n).trimEnd() + "..." : s;
+    L.push(indent(`first: [${first.role}] ${clip(first.content, 60)}`));
+    if (allTurns.length > 1) {
+      L.push(indent(`last:  [${last.role}] ${clip(last.content, 60)}`));
+    }
+  } else {
+    L.push(indent("(no turns yet)"));
+  }
+  L.push("");
+
   L.push("REPL Variables");
   if (varsEntries.length === 0) {
     L.push(indent("(empty)"));
@@ -142,10 +166,11 @@ export async function buildContextDisplay(
   }
   L.push("");
 
-  L.push("Bash Helpers");
-  L.push(indent(`subagent '<prompt>'          — spawn child OpenCode session`));
-  L.push(indent(`subagent_batch '<json>'      — parallel subagents`));
-  L.push(indent(`llm-subcall "prompt"         — single LLM call (no tools)`));
+  L.push("Bash Commands");
+  L.push(indent(`subagent '<prompt>'          — single LLM call (no tools)`));
+  L.push(indent(`subagent_batch '<json>'      — parallel LLM calls`));
+  L.push(indent(`llm-subcall "prompt"         — alias for subagent`));
+  L.push(indent(`opencode run "prompt"        — full child session with tools`));
   L.push(indent(`list_tools                   — list available tool IDs`));
   L.push("");
 

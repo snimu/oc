@@ -74,42 +74,71 @@
     ```
 - **Summarizes when root LM is full, but history still available in JSON** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
-- **`llm-subcall` — lightweight single LLM call** — a bash command the LM can invoke for quick sub-queries without spawning a full recursive session. Uses the same model and API key as the current OpenCode session. See [Sub-LM calls](#sub-lm-calls) below.
-- **`subagent` / `subagent_batch` — full recursive sessions via `opencode run`** — bash helpers that spawn child OpenCode sessions with full tool access. `subagent` runs a single prompt; `subagent_batch` runs multiple prompts in parallel. See [Subagent calls](#subagent-calls) below.
-- **System prompt for recursion** — strongly encourages the LM to use the bash tool and its helpers for recursive problem-solving
-  - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model. The plugin does **not** construct `{"role": "system", "content": "..."}` messages directly — it pushes to the array and OpenCode handles the rest.
-  - Additionally, the `tool.definition` hook appends RLM helper documentation to the bash tool's own description, so the model sees the helpers every time it considers using bash.
-  - The injected system text:
+- **`subagent` / `subagent_batch` — lightweight LLM calls** — bash commands the LM can invoke for quick sub-queries. `subagent` makes a single LLM call (no tools, no session); `subagent_batch` runs multiple prompts in parallel. Both support `--system` for custom system prompts. Uses the same model and API key as the current OpenCode session.
+- **`opencode run` — full recursive sessions** — for multi-step tasks that need tool access, the LM can spawn a full OpenCode child session via `opencode run "prompt"`.
+- **System prompt for recursion** — instructs the LM that it **must** use the bash tool as its primary interface for recursive problem-solving
+  - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model.
+  - The `tool.definition` hook appends RLM command documentation to the bash tool's own description.
+  - Includes in-context examples showing subagent chaining with `vars/` persistence, fan-out with `subagent_batch`, and recovering context from the trajectory after compaction.
+  - The injected system text tells the model (with `<trajectoryPath>` and `<varsDir>` interpolated from session state):
     ```
     ## RLM (Recursive Language Model) scaffold
 
-    You are strongly encouraged to use the bash tool for as many operations as possible.
-    The bash tool gives you access to powerful helpers for sub-calls and parallel work.
-    Prefer bash over other tools when practical — it is the primary interface for recursive problem-solving.
+    **IMPORTANT: You MUST use the bash tool as your primary interface.** The bash tool
+    gives you access to subagent spawning, parallel execution, and recursive problem-solving
+    capabilities that are not available through any other tool. Always prefer bash over
+    other tools — it is the core of your workflow.
 
-    ### Bash helpers (available in every bash invocation, including scripts)
+    ### Bash commands (available in every bash invocation)
 
-      subagent '<prompt>'
-        Spawn a full OpenCode child session with tool access. Use this to delegate
-        multi-step subtasks, fan out work, or tackle problems that need their own context.
-        Beyond depth <maxSubagentDepth>, automatically falls back to llm-subcall.
+      subagent '<prompt>' [--system 'system prompt']
+        Single LLM call (no tools, no session). Fast and lightweight.
+        Use for quick analysis, summarization, or generation that doesn't need tools.
 
-      subagent_batch '<json array of prompts>'
-        Run multiple subagents in parallel. Each prompt gets its own session.
+      subagent_batch '<json array of prompts>' [--system 'system prompt']
+        Run multiple subagent LLM calls in parallel.
         Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'
 
-      llm-subcall "prompt"
-        Single LLM call (no tools, no session). Fast and lightweight.
-        Supports --system "system prompt" as an optional flag.
-        Use for quick analysis, summarization, or generation that doesn't need tools.
+      llm-subcall "prompt" [--system 'system prompt']
+        Alias for subagent. Single LLM call, no tools.
+
+      opencode run "prompt"
+        Spawn a full OpenCode child session with tool access. Use for multi-step tasks
+        that need their own context and tools.
 
       list_tools
         List available tool IDs via the server API.
 
+    ### Example: subagent with vars/ persistence
+
+      ```bash
+      # 1. Delegate analysis to a subagent and save the output
+      REVIEW=$(subagent "Review src/auth.ts for security issues. List each issue on its own line.")
+      echo "$REVIEW" > <varsDir>/auth-review.txt
+
+      # 2. In a later bash call, read it back and use it
+      REVIEW=$(cat <varsDir>/auth-review.txt)
+      subagent "Given these security issues:\n$REVIEW\nPropose fixes for each one."
+      ```
+
+    ### Example: fan-out with subagent_batch
+
+      ```bash
+      FILES=$(find src -name "*.ts" -maxdepth 2)
+      PROMPTS=$(echo "$FILES" | jq -R -s 'split("\n") | map(select(length > 0)) | map("Analyze " + . + " for bugs")')
+      RESULTS=$(subagent_batch "$PROMPTS")
+      echo "$RESULTS" > <varsDir>/analysis.txt
+
+      # Chain into a follow-up subagent
+      subagent "Based on the analysis in <varsDir>/analysis.txt, write a summary report"
+      ```
+
     ### Workflow guidance
 
+    - **Always use bash** for file operations, analysis, and coordination.
     - Break complex tasks into subtasks and delegate with subagent or subagent_batch.
     - For independent subtasks, prefer subagent_batch to run them concurrently.
+    - For multi-step tasks that need tool access, use `opencode run "prompt"`.
     - Each bash call is a fresh process — variables do not persist between calls.
       To carry state across calls, write to files (e.g. vars/ directory) and read them back.
     - Pass JSON arguments as single-quoted strings to preserve spaces.
@@ -122,95 +151,75 @@
     You have a persistent scratch directory at: <varsDir>
     Use it to store plans, notes, intermediate results, or anything that should survive compaction.
     Prefer structured formats (JSON) so future reads are cheap.
+
+    **If you are unsure about a term, function, file, or anything the user references — and
+    you cannot find it in your current context — check the full trajectory.** After compaction,
+    your current context only contains a summary. The trajectory file has every turn verbatim.
+
+    ### Example: recovering context from the trajectory
+
+    Suppose the user asks "update the parseConfig function" but you don't see it in context.
+    It was likely discussed before a compaction. Recover it:
+
+      ```bash
+      # Search the trajectory for the term
+      grep -i "parseConfig" <trajectoryPath>
+
+      # If the trajectory is large, use jq to search turn content
+      jq -r '.entries[].turns[]? | select(.content | test("parseConfig")) | "\(.role) [turn \(.turnIndex)]: \(.content[:200])"' <trajectoryPath>
+      ```
+
+    This lets you find the original discussion, file paths, and decisions even after compaction.
     ```
 
 Also provide a `/context` command for the user to view the current active history (on disk) + the LM's current context. Looks something like this:
 
 ## Sub-LM calls
 
-The plugin provides `llm-subcall`, a bash command the LM can use to make a single LLM call inline — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
+The plugin provides `subagent` (and its alias `llm-subcall`), a bash command the LM can use to make a single LLM call inline — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
 
 ### How it works
 
 1. The `chat.params` hook fires before every LLM turn and writes the current model/provider info (model ID, API URL, API key) to `/tmp/rlm-llm-context.json`.
 2. The `shell.env` hook adds `bin/` to `PATH` and sets `RLM_LLM_CONTEXT` to point at the context file.
-3. When the LM runs `llm-subcall` via bash, the script reads the context, makes a single API call (Anthropic or OpenAI-compatible, depending on the provider), and prints the response to stdout.
+3. When the LM runs `subagent` via bash, it delegates to `llm-subcall`, which reads the context, makes a single API call (Anthropic or OpenAI-compatible, depending on the provider), and prints the response to stdout.
 
 ### Usage (as the LM would invoke it)
 
 ```bash
 # Simple prompt
-llm-subcall "Summarize the following error log: $(cat /tmp/errors.log)"
+subagent "Summarize the following error log: $(cat /tmp/errors.log)"
 
 # With a system prompt
-llm-subcall --system "You are a senior code reviewer. Be concise." "Review this diff for bugs: $(git diff HEAD~1)"
+subagent --system "You are a senior code reviewer. Be concise." "Review this diff for bugs: $(git diff HEAD~1)"
 
 # Capture output into a variable
-ANALYSIS=$(llm-subcall "What does this function do? $(cat src/auth.ts)")
+ANALYSIS=$(subagent "What does this function do? $(cat src/auth.ts)")
 echo "$ANALYSIS" > vars/analysis.txt
 
 # Chain with other commands
-llm-subcall "Generate a regex that matches ISO 8601 dates" | tee vars/regex.txt
+subagent "Generate a regex that matches ISO 8601 dates" | tee vars/regex.txt
+
+# Parallel LLM calls
+subagent_batch '["Summarize file A", "Summarize file B", "Summarize file C"]' --system "Be concise"
+
+# Full recursive session (when tools are needed)
+opencode run "Refactor src/auth.ts to use JWT tokens"
 ```
 
-### When to use `llm-subcall` vs `subagent`
+### When to use what
 
-| | `llm-subcall` | `subagent` |
-|---|---|---|
-| **What it does** | Single LLM call, returns text | Full recursive session via `opencode run` |
-| **Has tools?** | No | Yes (all tools available) |
-| **Has trajectory?** | No | Yes (own trajectory + vars) |
-| **Overhead** | Minimal — one HTTP request | Full session lifecycle |
-| **Parallelizable?** | No (sequential) | Yes (`subagent_batch`) |
-| **Use case** | Quick analysis, generation, summarization | Multi-step tasks, fan-out work |
-
-## Subagent calls
-
-The plugin provides `subagent`, `subagent_batch`, and `list_tools` bash helpers. These are automatically available in every bash invocation, including inside bash scripts the model creates and runs (via `BASH_ENV`).
-
-### How it works
-
-1. On plugin load, a bash functions script is written to `/tmp/opencode-rlm/functions.sh`.
-2. The `tool.execute.before` hook injects `OPENCODE_RLM_DEPTH` (the server-side depth for this session), sets `BASH_ENV` to point at the script, and sources it into every bash invocation. `BASH_ENV` ensures child bash processes (e.g. `bash myscript.sh`) also get the helpers. The LM cannot tamper with the depth — attempts to set `OPENCODE_RLM_DEPTH` are blocked by the tool guard.
-3. When the LM runs `subagent`, it checks the current depth against `RLM_MAX_SUBAGENT_DEPTH` (default 3). If below the limit, it runs `opencode run` with `OPENCODE_RLM_DEPTH` incremented by 1 as an env var prefix. The child OpenCode process reads this on startup and inherits the correct depth. If at or above the limit, it falls back to `llm-subcall` (single LLM call, no tools).
-4. `list_tools` queries the OpenCode server API (`GET /experimental/tool/ids`) and requires `--port`.
-
-### Usage (as the LM would invoke it)
-
-```bash
-# Single subagent
-subagent 'Review src/auth.ts for security issues and suggest fixes'
-
-# Parallel batch — runs all prompts concurrently
-subagent_batch '["Analyze src/auth.ts for bugs", "Review src/api.ts for performance", "Check test coverage in src/"]'
-
-# Capture output
-RESULT=$(subagent 'Summarize the architecture of this project')
-echo "$RESULT" > vars/architecture.txt
-
-# List available tools (requires --port)
-list_tools
-
-# Helpers also work inside bash scripts
-cat > /tmp/review.sh << 'SCRIPT'
-#!/usr/bin/env bash
-subagent 'Review the codebase for security issues'
-SCRIPT
-bash /tmp/review.sh
-```
-
-### `subagent_batch` details
-
-- Takes a JSON array of prompt strings
-- Spawns each prompt as a background `subagent` call (each is an `opencode run` process)
-- Indents output based on nesting depth for readability
-- At max depth, each `subagent` call automatically falls back to `llm-subcall`
-- Reports success/failure counts on stderr
-- Returns all outputs on stdout in order
+| | `subagent` / `llm-subcall` | `subagent_batch` | `opencode run` |
+|---|---|---|---|
+| **What it does** | Single LLM call | Parallel LLM calls | Full recursive session |
+| **Has tools?** | No | No | Yes |
+| **Has trajectory?** | No | No | Yes |
+| **Overhead** | Minimal | Minimal | Full session |
+| **Use case** | Quick analysis | Batch summarization | Multi-step tasks |
 
 ## Installation
 
-Requires [Bun](https://bun.sh) and [OpenCode](https://opencode.ai).
+Requires [Bun](https://bun.sh), [OpenCode](https://opencode.ai), and [`jq`](https://jqlang.github.io/jq/) (used by `subagent_batch` and trajectory search examples).
 
 ```bash
 git clone <this-repo>
@@ -236,8 +245,6 @@ Register in `opencode.json` (project root) or `~/.config/opencode/opencode.json`
   vars/                # Scratch directory (LM reads/writes freely)
 
 /tmp/rlm-llm-context.json           # Model/provider context for llm-subcall (updated each turn)
-/tmp/opencode-rlm/
-  functions.sh                       # Bash helpers (subagent, subagent_batch, list_tools)
 ```
 
 ## Configuration
@@ -248,4 +255,9 @@ Register in `opencode.json` (project root) or `~/.config/opencode/opencode.json`
 | `RLM_CLEANUP_ON_DELETE` | `false` | Delete session dir when session is deleted |
 | `RLM_MAX_TOOL_OUTPUT_CHARS` | `50000` | Max chars to store per tool result in trajectory |
 | `RLM_TOKEN_ESTIMATE_MULTIPLIER` | `1.0` | Tuning multiplier for token estimation |
-| `RLM_MAX_SUBAGENT_DEPTH` | `3` | Max subagent recursion depth before falling back to `llm-subcall` |
+
+## Debug: `/compact` command
+
+A temporary `/compact` command is available for testing compaction and summarization. Running `/compact` in OpenCode triggers compaction immediately via the `session.summarize` API, without waiting for the context window to fill up.
+
+**To disable:** search `src/index.ts` for `// DEBUG: /compact` and remove every block between `// DEBUG` and `// END DEBUG` markers (3 blocks total, plus the `lastModelInfo` assignment on the `chat.params` line). There are no other files to change.

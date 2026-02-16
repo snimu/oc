@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Lightweight LLM call wrapper. Delegates to llm-subcall.
+# Usage: subagent '<prompt>' [--system 'system prompt']
+
+llm-subcall "$@"

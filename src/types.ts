@@ -68,6 +68,4 @@ export interface RLMConfig {
   maxToolOutputChars: number;
   /** Multiplier for token estimator tuning. Default: 1.0 */
   tokenEstimateMultiplier: number;
-  /** Max subagent recursion depth before falling back to llm-subcall. Default: 3 */
-  maxSubagentDepth: number;
 }
