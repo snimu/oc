@@ -25,12 +25,31 @@ const llmContextPath = "/tmp/rlm-llm-context.json";
  */
 function buildBashFunctionsScript(sessionIdPath: string, llmCliPath: string): string {
   return `#!/usr/bin/env bash
+# Enable bash emulation mode in zsh for this file and all functions defined in it
+[[ -n "$ZSH_VERSION" ]] && emulate -L bash 2>/dev/null
 export OPENCODE_RLM_SESSION="\$(cat "${sessionIdPath}")"
 export OPENCODE_RLM_DEPTH="\${OPENCODE_RLM_DEPTH:-0}"
 
 # llm-subcall: single LLM call (no tools, no session)
+# Usage:
+#   llm-subcall "prompt"
+#   llm-subcall --system "sys" "prompt"
+#   llm-subcall <<'EOF'            — prompt via heredoc
+#   ...complex prompt...
+#   EOF
+#   llm-subcall --system "sys" <<'EOF'
+#   ...complex prompt...
+#   EOF
 llm-subcall() {
-  bun "${llmCliPath}" "$@"
+  # If stdin is not a terminal (heredoc/pipe), read prompt from stdin
+  # and append it as the last argument (works with or without --system)
+  if [[ ! -t 0 ]]; then
+    local stdin_prompt
+    stdin_prompt=\$(cat)
+    bun "${llmCliPath}" "$@" "$stdin_prompt"
+  else
+    bun "${llmCliPath}" "$@"
+  fi
 }
 
 # Build indent prefix based on nesting depth
@@ -87,11 +106,12 @@ subagent() {
   # Call streaming endpoint — each line is a JSON event
   local result=""
   local had_error=0
-  while IFS= read -r line; do
-    local etype
-    etype=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null)
-    local etext
-    etext=$(printf '%s' "$line" | jq -r '.text // empty' 2>/dev/null)
+  local etype=""
+  local etext=""
+  while IFS= read -r _rlm_line; do
+    [[ -z "$_rlm_line" ]] && continue
+    etype="$(printf '%s' "$_rlm_line" | jq -r '.type // empty' 2>/dev/null)" || etype=""
+    etext="$(printf '%s' "$_rlm_line" | jq -r '.text // empty' 2>/dev/null)" || etext=""
 
     case "$etype" in
       progress)
@@ -104,8 +124,11 @@ subagent() {
         printf '%s│ [error] %s\\n' "$indent" "$etext" >&2
         had_error=1
         ;;
+      heartbeat)
+        # keep-alive, ignore
+        ;;
     esac
-  done < <(curl -sS -N -X POST "$OPENCODE_RLM_URL/session/run" \\
+  done < <(curl -sS -N --max-time 300 -X POST "$OPENCODE_RLM_URL/session/run" \\
     -H "$H" "\${auth_args[@]}" \\
     -H "x-opencode-directory: $OPENCODE_RLM_DIR_PATH" \\
     -d "$body")
@@ -209,8 +232,14 @@ function formatToolPart(part: any): string | null {
       let cmd = input.command.replace(/^source "[^"]*functions\.sh"\n/, "").trim();
       cmd = cmd.length > 80 ? cmd.slice(0, 80) + "…" : cmd;
       detail = `: ${cmd}`;
+    } else if (toolName === "bash" && (!input || !input.command)) {
+      // Bash tool call still being assembled (streaming) — skip for now
+      return null;
     } else if (input) {
       const s = JSON.stringify(input);
+      if (s === "{}" || s === "null") {
+        return null; // Input not populated yet
+      }
       detail = s.length > 80 ? `: ${s.slice(0, 80)}…` : `: ${s}`;
     }
     return `  ⟳ ${toolName}${detail}`;
@@ -313,33 +342,58 @@ async function startProxyServer(
                 }
 
                 // 3. Poll for completion, streaming tool call progress
-                // Race condition fix: after promptAsync returns, the session may still
-                // show "idle" for a brief moment before transitioning to "busy".
-                // We must wait until we've seen "busy" at least once before treating
-                // a non-busy status as completion.
+                //
+                // Key race conditions handled:
+                // a) After promptAsync, the session may still be "idle" briefly before
+                //    becoming "busy". We wait up to MAX_IDLE_RETRIES before giving up.
+                // b) Between consecutive tool calls, the session may go briefly "idle"
+                //    before the next tool call starts. We require IDLE_COOLDOWN
+                //    consecutive idle polls after having seen "busy" before declaring done.
                 let seenParts = new Set<string>();
                 let seenBusy = false;
-                let idleRetries = 0;
-                const MAX_IDLE_RETRIES = 20; // up to 10s waiting for session to start
+                let initialIdleRetries = 0;
+                let consecutiveIdle = 0;
+                const MAX_IDLE_RETRIES = 30; // up to 15s waiting for session to start
+                const IDLE_COOLDOWN = 6;     // 3s of idle after busy = truly done
+                const POLL_INTERVAL = 500;
+                let heartbeatCounter = 0;
+
                 while (true) {
+                  // Send periodic heartbeats to keep the HTTP stream alive
+                  heartbeatCounter++;
+                  if (heartbeatCounter % 4 === 0) {
+                    send({ type: "heartbeat" });
+                  }
+
                   // Check status
-                  const { data: statuses } = await client.session.status();
-                  const status = statuses ? (statuses as any)[sid]?.type ?? "idle" : "idle";
+                  let status = "idle";
+                  try {
+                    const { data: statuses } = await client.session.status();
+                    status = statuses ? (statuses as any)[sid]?.type ?? "idle" : "idle";
+                  } catch {
+                    // If status check fails, assume still running
+                    if (seenBusy) status = "busy";
+                  }
+
                   if (status === "busy") {
                     seenBusy = true;
-                    idleRetries = 0;
+                    consecutiveIdle = 0;
                   } else if (!seenBusy) {
                     // Haven't seen busy yet — session might not have started processing
-                    idleRetries++;
-                    if (idleRetries >= MAX_IDLE_RETRIES) {
+                    initialIdleRetries++;
+                    if (initialIdleRetries >= MAX_IDLE_RETRIES) {
                       send({ type: "error", text: "Timed out waiting for session to start" });
                       break;
                     }
-                    await new Promise((r) => setTimeout(r, 500));
+                    await new Promise((r) => setTimeout(r, POLL_INTERVAL));
                     continue;
                   } else {
-                    // Was busy, now done
-                    break;
+                    // Was busy, now idle — but might go busy again between tool calls.
+                    // Wait for several consecutive idle polls before declaring done.
+                    consecutiveIdle++;
+                    if (consecutiveIdle >= IDLE_COOLDOWN) {
+                      break; // truly done
+                    }
                   }
 
                   // Fetch messages and stream new tool calls
@@ -362,7 +416,7 @@ async function startProxyServer(
                     // Best-effort progress
                   }
 
-                  await new Promise((r) => setTimeout(r, 500));
+                  await new Promise((r) => setTimeout(r, POLL_INTERVAL));
                 }
 
                 // 4. Fetch final result
@@ -705,17 +759,25 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `### Bash commands (available in every bash invocation)`,
           ``,
           `  subagent '<prompt>'`,
+          `  subagent <<'EOF'`,
+          `  ...complex prompt...`,
+          `  EOF`,
           `    Spawn a full OpenCode child session with tool access.`,
           `    Tool calls and progress are streamed to stderr during execution.`,
           `    The final result is returned on stdout.`,
+          `    **Use heredoc syntax (<<'EOF') for prompts containing quotes, braces, or special chars.**`,
           ``,
           `  subagent_batch '<json array of prompts>'`,
           `    Run multiple subagent sessions in parallel. Each prompt gets its own child session.`,
           `    Example: subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'`,
           ``,
           `  llm-subcall "prompt" [--system 'system prompt']`,
+          `  llm-subcall <<'EOF'`,
+          `  ...complex prompt...`,
+          `  EOF`,
           `    Single LLM call (no tools, no session). Fast and lightweight.`,
           `    Use for quick analysis, summarization, or generation that doesn't need tools.`,
+          `    **Use heredoc syntax (<<'EOF') for prompts containing quotes, braces, or special chars.**`,
           ``,
           `  list_tools`,
           `    List available tool IDs via the server API.`,
@@ -729,6 +791,20 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `echo "$RESULTS" > ${state.varsDir}/analysis.txt`,
           `\`\`\``,
           ``,
+          `### Shell compatibility (IMPORTANT)`,
+          ``,
+          `The shell is **zsh**, not bash. Write POSIX-compatible or zsh-safe code:`,
+          `- Do NOT use \`bash -c\` or bashisms like \`\${var//pattern/replace}\` — use \`sed\` instead.`,
+          `- Do NOT use \`mapfile\` or \`readarray\` — use \`while read\` loops instead.`,
+          `- Do NOT use \`local -a\` — use \`local arr; arr=()\` instead.`,
+          `- Avoid \`match\` as a variable name in \`awk\` — it is a built-in function.`,
+          `- Use \`[[ ... ]]\` for conditionals (works in both bash and zsh).`,
+          `- For regex matching, use \`grep -E\` or \`rg\` rather than bash regex operators.`,
+          `- Quote ALL variable expansions: \`"$var"\` not \`$var\`.`,
+          `- For process substitution \`<(...)\`, prefer piping instead: \`cmd | while read ...\`.`,
+          `- For string replacement: \`echo "$var" | sed 's/old/new/g'\` instead of \`\${var//old/new}\`.`,
+          `- Test scripts with \`zsh -n script.sh\` before running if complex.`,
+          ``,
           `### Workflow guidance`,
           ``,
           `- **Always use bash** for file operations, analysis, and coordination.`,
@@ -737,6 +813,13 @@ export const RLMPlugin: Plugin = async (ctx) => {
           `- For quick LLM queries without tool access, use llm-subcall.`,
           `- Each bash call is a fresh process — variables do not persist between calls.`,
           `  To carry state across calls, write to files (e.g. vars/ directory) and read them back.`,
+          `- **IMPORTANT**: For complex prompts with quotes, braces, backslashes, or JSON, ALWAYS use heredoc syntax:`,
+          `  \`\`\`bash`,
+          `  subagent <<'EOF'`,
+          `  Your complex prompt with "quotes", {braces}, and $pecial chars here.`,
+          `  EOF`,
+          `  \`\`\``,
+          `  This prevents all shell parsing issues. Only use single-quoted args for short, simple prompts.`,
           `- Pass JSON arguments as single-quoted strings to preserve spaces.`,
           ``,
           `### Trajectory and scratch space`,
