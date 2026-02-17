@@ -38,85 +38,30 @@ Add the plugin to `~/.config/opencode/opencode.json`. This enables the RLM plugi
 
 ## What it does
 
-- **Tracks full RLM history without discarding information** — appends every turn to `active/trajectory.json` so nothing is lost on compaction
-  - The trajectory is stored as a single JSON document with segments and compaction summaries interleaved in order. After two compaction cycles the file looks like:
-    ```json
-    {
-      "version": 1,
-      "sessionId": "abc-123",
-      "createdAt": "2026-02-13T10:00:00.000Z",
-      "lastUpdatedAt": "2026-02-13T10:45:00.000Z",
-      "entries": [
-        {
-          "type": "segment",
-          "segmentIndex": 0,
-          "turns": [
-            { "turnIndex": 0, "role": "user", "content": "Fix the login bug", "estimatedTokens": 8, "timestamp": "2026-02-13T10:00:01.000Z" },
-            { "turnIndex": 1, "role": "assistant", "content": "I'll investigate the auth module...", "estimatedTokens": 120, "timestamp": "2026-02-13T10:00:05.000Z" },
-            { "turnIndex": 2, "role": "tool_use", "content": "Tool call: read", "estimatedTokens": 6, "timestamp": "2026-02-13T10:00:06.000Z", "toolName": "read", "toolArgs": "{\"file_path\":\"/src/auth.ts\"}" },
-            { "turnIndex": 3, "role": "tool_result", "content": "export function login() { ... }", "estimatedTokens": 85, "timestamp": "2026-02-13T10:00:07.000Z", "toolName": "read" }
-          ],
-          "totalEstimatedTokens": 219,
-          "startedAt": "2026-02-13T10:00:00.000Z",
-          "compactedAt": "2026-02-13T10:15:00.000Z"
-        },
-        {
-          "type": "compaction",
-          "segmentIndex": 0,
-          "summary": "Investigated login bug in /src/auth.ts. Found missing null check on token refresh. Applied fix and verified tests pass.",
-          "summaryTokens": 30,
-          "originalTokens": 219,
-          "compactedAt": "2026-02-13T10:15:00.000Z"
-        },
-        {
-          "type": "segment",
-          "segmentIndex": 1,
-          "turns": [
-            { "turnIndex": 4, "role": "user", "content": "Now add rate limiting to the API", "estimatedTokens": 12, "timestamp": "2026-02-13T10:15:30.000Z" },
-            { "turnIndex": 5, "role": "assistant", "content": "I'll add a rate limiter middleware...", "estimatedTokens": 200, "timestamp": "2026-02-13T10:16:00.000Z" }
-          ],
-          "totalEstimatedTokens": 212,
-          "startedAt": "2026-02-13T10:15:00.000Z",
-          "compactedAt": "2026-02-13T10:30:00.000Z"
-        },
-        {
-          "type": "compaction",
-          "segmentIndex": 1,
-          "summary": "Added token-bucket rate limiter middleware in /src/middleware/rate-limit.ts. Configured at 100 req/min per IP. Integrated into Express app and added tests.",
-          "summaryTokens": 42,
-          "originalTokens": 212,
-          "compactedAt": "2026-02-13T10:30:00.000Z"
-        },
-        {
-          "type": "segment",
-          "segmentIndex": 2,
-          "turns": [
-            { "turnIndex": 6, "role": "user", "content": "Looks good, now update the README", "estimatedTokens": 10, "timestamp": "2026-02-13T10:30:30.000Z" }
-          ],
-          "totalEstimatedTokens": 10,
-          "startedAt": "2026-02-13T10:30:00.000Z",
-          "compactedAt": null
-        }
-      ],
-      "stats": {
-        "totalTurns": 7,
-        "totalCompactions": 2,
-        "totalTokensProcessed": 441,
-        "currentActiveTokens": 10
-      }
-    }
-    ```
+- **Tracks full RLM history without discarding information** — appends every turn to `active/trajectory.json` so nothing is lost on compaction. The trajectory is a single JSON document with segments and compaction summaries interleaved:
+  ```json
+  {
+    "entries": [
+      { "type": "segment", "segmentIndex": 0, "turns": [
+        { "role": "user", "content": "Fix the login bug", ... },
+        { "role": "assistant", "content": "I'll investigate...", ... },
+        { "role": "tool_use", "content": "Tool call: read", "toolName": "read", ... },
+        { "role": "tool_result", "content": "export function login() { ... }", ... }
+      ], "compactedAt": "2026-02-13T10:15:00.000Z" },
+      { "type": "compaction", "segmentIndex": 0, "summary": "Fixed login bug: missing null check on token refresh." },
+      { "type": "segment", "segmentIndex": 1, "turns": [...], "compactedAt": null }
+    ],
+    "stats": { "totalTurns": 7, "totalCompactions": 1, "totalTokensProcessed": 441 }
+  }
+  ```
 - **Summarizes when root LM is full, but history still available in JSON** — injects past trajectory summaries into the compaction prompt so the continuation summary is RLM-aware
 - **Scratch directory** — provides `vars/` for the LM to persist plans, notes, and intermediates across compaction boundaries
-- **`subagent` / `subagent_batch` — full recursive sessions via the OpenCode API** — bash commands that spawn child OpenCode sessions with full tool access. `subagent` runs a single prompt; `subagent_batch` runs multiple prompts in parallel. Child sessions are visible in the TUI via Ctrl-X. See [Subagent calls](#subagent-calls) below.
-- **`llm-subcall` — lightweight single LLM call** — a bash command the LM can invoke for quick sub-queries without spawning a full session. Uses the same model and API key as the current OpenCode session. See [Sub-LM calls](#sub-lm-calls) below.
-- **Disables tools with bash equivalents** — the `config` hook disables `read`, `write`, `edit`, `glob`, `grep`, `webfetch`, `codesearch`, `apply_patch`, and `task`, forcing the LM to use bash for all operations. This keeps the workflow consistent and ensures all file operations go through the bash tool permission system.
-- **System prompt for recursion** — instructs the LM that it **must** use the bash tool as its primary interface for recursive problem-solving
-  - Injected via the `experimental.chat.system.transform` hook, which pushes a plain string onto `output.system: string[]`. OpenCode's runtime collects these strings and delivers them as system-level content to the model.
-  - The `tool.definition` hook appends RLM command documentation to the bash tool's own description.
-  - Includes in-context examples showing subagent chaining with `vars/` persistence, fan-out with `subagent_batch`, and recovering context from the trajectory after compaction.
+- **`subagent` / `subagent_batch`** — bash commands that spawn child OpenCode sessions with full tool access. `subagent` runs a single prompt; `subagent_batch` runs multiple prompts in parallel. Child sessions are visible in the TUI via Ctrl-X.
+- **`llm-subcall`** — lightweight single LLM call (no tools, no session). Uses the same model and API key as the current session.
+- **Disables tools with bash equivalents** — forces the LM through bash for all operations (`read` → `cat`, `write` → heredocs, `edit` → `sed`, `grep` → `grep`/`rg`, etc.)
+- **System prompt for recursion** — instructs the LM to use bash as its primary interface, with in-context examples showing programmatic subagent patterns
 
-Also provides a `/context` command for the user to view the current active history (on disk) + the LM's current context.
+Also provides a `/context` command for the user to view token usage, compaction history, and trajectory status.
 
 ## Subagent calls
 
@@ -133,38 +78,118 @@ The plugin provides `subagent` and `subagent_batch` as sourced bash functions (v
    - Progress (tool calls) is displayed on stderr with box-drawing; the final result goes to stdout
 4. `subagent_batch` calls `POST /session/run-batch` which runs all sessions in parallel, streams interleaved progress, then wipes and reprints grouped by agent.
 
-### Usage (as the LM would invoke it)
+### Basic usage
 
 ```bash
-# Single subagent (full session with tools, visible in Ctrl-X)
-subagent 'Review src/auth.ts for security issues and suggest fixes'
+# Single subagent
+subagent 'Review src/auth.ts for security issues'
 
-# Heredoc for complex prompts (prevents shell parsing issues)
+# Heredoc for complex prompts
 subagent <<'EOF'
 Analyze the codebase for {security issues} and "performance problems".
-Focus on: auth, API layer, and database queries.
 EOF
 
-# Parallel subagents — runs all prompts concurrently
-subagent_batch '["Analyze src/auth.ts for bugs", "Review src/api.ts for performance", "Check test coverage in src/"]'
-
-# Capture output
-RESULT=$(subagent 'Summarize the architecture of this project')
-echo "$RESULT" > vars/architecture.txt
+# Parallel subagents
+subagent_batch '["Analyze src/auth.ts", "Review src/api.ts", "Check test coverage"]'
 
 # Quick LLM call (no tools, fast)
 SUMMARY=$(llm-subcall "Summarize this error: $(cat /tmp/rlm/errors.log)")
 ```
 
+### Example: parallel review with conditional follow-up
+
+Scan source files, fan out reviews in parallel, then only fix files that have issues:
+
+```bash
+VARS="/tmp/rlm/session-xxx/vars"
+
+# 1. Discover files and build per-file review prompts as a JSON array
+find src -name "*.ts" -not -name "*.test.ts" | head -10 > "$VARS/files.txt"
+PROMPTS='[]'
+while IFS= read -r f; do
+  PROMPTS=$(echo "$PROMPTS" | jq --arg f "$f" \
+    '. + ["Review " + $f + " for bugs. List issues as ISSUE:<severity>:<line>:<description>. If none, output NONE."]')
+done < "$VARS/files.txt"
+
+# 2. Fan out — all files reviewed concurrently
+subagent_batch "$PROMPTS" > "$VARS/reviews.txt"
+
+# 3. Extract high-severity issues
+grep "ISSUE:high:" "$VARS/reviews.txt" > "$VARS/high-issues.txt" || true
+COUNT=$(wc -l < "$VARS/high-issues.txt" | tr -d ' ')
+
+# 4. Conditionally spawn fix agents
+if [[ "$COUNT" -gt 0 ]]; then
+  FIX_PROMPTS='[]'
+  for f in $(sed 's/ISSUE:high://; s/:.*//' "$VARS/high-issues.txt" | sort -u); do
+    ISSUES=$(grep "$f" "$VARS/high-issues.txt")
+    FIX_PROMPTS=$(echo "$FIX_PROMPTS" | jq --arg f "$f" --arg i "$ISSUES" \
+      '. + ["Fix these issues in " + $f + ":\n" + $i]')
+  done
+  subagent_batch "$FIX_PROMPTS"
+
+  # 5. Verify
+  if bun test 2>&1 | tail -5; then
+    echo "All tests pass"
+  else
+    echo "Tests failed — review changes"
+  fi
+else
+  echo "No high-severity issues"
+fi
+```
+
+### Example: iterative investigation with accumulating context
+
+Trace a bug through the call stack — each step informs the next:
+
+```bash
+VARS="/tmp/rlm/session-xxx/vars"
+
+# 1. Find potential error sites
+grep -rn "getUser" src/ --include="*.ts" | head -30 > "$VARS/refs.txt"
+
+# 2. Use llm-subcall (fast, no tools) to triage
+SUSPECTS=$(llm-subcall --system 'Output ONLY file:line pairs, one per line.' <<'PROMPT'
+The error is: "TypeError: Cannot read property 'user' of undefined"
+Which of these could cause it?
+
+$(cat "$VARS/refs.txt")
+PROMPT
+)
+echo "$SUSPECTS" > "$VARS/suspects.txt"
+
+# 3. Fan out deep investigation — each suspect gets a subagent with tool access
+PROMPTS='[]'
+while IFS= read -r loc; do
+  [[ -z "$loc" ]] && continue
+  PROMPTS=$(echo "$PROMPTS" | jq --arg loc "$loc" \
+    '. + ["Investigate " + $loc + " — trace the data flow, read the file, check callers. End with VERDICT:yes or VERDICT:no"]')
+done < "$VARS/suspects.txt"
+subagent_batch "$PROMPTS" > "$VARS/investigations.txt"
+
+# 4. If a root cause was found, spawn a fix agent with the evidence
+if grep -q "VERDICT:yes" "$VARS/investigations.txt"; then
+  EVIDENCE=$(awk '/VERDICT:yes/{found=1} found' "$VARS/investigations.txt" | head -50)
+  subagent <<FIXPROMPT
+Based on this investigation:
+$EVIDENCE
+
+Apply a fix for the TypeError. Then run the relevant tests to verify.
+FIXPROMPT
+else
+  echo "No root cause found. Results in $VARS/investigations.txt"
+fi
+```
+
+**Key patterns**: programmatic control flow (if/else, loops), data pipelines (jq, grep, awk), fan-out-then-converge (subagent_batch + aggregate), mixed tools (llm-subcall for fast triage, subagent for deep work), persistent state (vars/ across bash calls).
+
 ## Sub-LM calls
 
-The plugin also provides `llm-subcall`, a lightweight bash command for single LLM calls — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
+`llm-subcall` is a lightweight bash command for single LLM calls — no tools, no session, no trajectory overhead. It automatically uses the same model and API key as the current OpenCode session.
 
-### How it works
-
-1. The `chat.params` hook fires before every LLM turn and writes the current model/provider info (model ID, API URL, API key) to `/tmp/rlm/llm-context.json`.
-2. The `shell.env` hook sets `RLM_LLM_CONTEXT` to point at the context file.
-3. `llm-subcall` reads the context, makes a single API call (Anthropic or OpenAI-compatible), and prints the response to stdout.
+1. The `chat.params` hook writes model/provider info to `/tmp/rlm/llm-context.json`.
+2. `llm-subcall` reads it, makes a single API call (Anthropic or OpenAI-compatible), and prints to stdout.
 
 ### When to use what
 
