@@ -68,7 +68,7 @@ Also provides a `/context` command for the user to view token usage, compaction 
 
 The following is pushed onto `output.system[]` via the `experimental.chat.system.transform` hook. Paths like `<trajectoryPath>` and `<varsDir>` are interpolated from session state at runtime.
 
-```markdown
+````markdown
 ## RLM (Recursive Language Model) scaffold
 
 **IMPORTANT: You MUST use the bash tool as your primary interface.** Most other tools
@@ -267,7 +267,7 @@ Prefer structured formats (JSON) so future reads are cheap.
 **If you are unsure about a term, function, or file the user references — check the trajectory.**
 After compaction, your context only has a summary. The trajectory has every turn verbatim:
 `grep -i "parseConfig" <trajectoryPath>` or use jq to search turn content.
-```
+````
 
 </details>
 
@@ -306,7 +306,7 @@ SUMMARY=$(llm-subcall "Summarize this error: $(cat /tmp/rlm/errors.log)")
 
 ### Example: parallel review with conditional follow-up
 
-Scan source files, fan out reviews in parallel, then only fix files that have issues:
+This example demonstrates how the LM can use **programmatic control flow** to orchestrate a multi-phase workflow. It starts by discovering source files and dynamically building a JSON array of review prompts using a `while read` loop and `jq`. Then it fans out all reviews concurrently via `subagent_batch` — each file gets its own child session with full tool access, running in parallel. The structured output format (`ISSUE:high:file:description`) lets the script use `grep` to filter results programmatically, and an `if/else` conditional decides whether to spawn a second round of fix agents. The fix prompts are themselves built dynamically by iterating over the grouped issues. Finally, the script verifies the fixes by running the test suite — closing the loop with automated validation.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
@@ -349,7 +349,7 @@ fi
 
 ### Example: iterative investigation with accumulating context
 
-Trace a bug through the call stack — each step informs the next:
+This example shows how different tool tiers can be **chained together in a pipeline**, with each step narrowing the search space for the next. It starts with a broad `grep` to find candidate locations, then uses `llm-subcall` (a fast, tool-less LLM call) to triage the candidates — this is cheap and quick because it doesn't need to read files or run tools. The triage results are written to `vars/` so they persist across bash calls. The filtered suspects are then fanned out to full `subagent` sessions (with tool access) for deep investigation — each subagent can read files, trace call chains, and check callers. The structured `VERDICT:yes/no` output lets the script use `grep` to determine if any investigation was conclusive, and conditionally spawn a final fix agent that receives the accumulated evidence as context.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
@@ -389,8 +389,6 @@ else
   echo "No root cause found. Results in $VARS/investigations.txt"
 fi
 ```
-
-**Key patterns**: programmatic control flow (if/else, loops), data pipelines (jq, grep, awk), fan-out-then-converge (subagent_batch + aggregate), mixed tools (llm-subcall for fast triage, subagent for deep work), persistent state (vars/ across bash calls).
 
 ## Sub-LM calls
 
