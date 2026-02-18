@@ -130,7 +130,7 @@ Do NOT write to `active/` — it is managed by the scaffold. Use `vars/` instead
 
 ### Example 1: parallel review with conditional follow-up
 
-Automatically review every source file for bugs by fanning out to parallel subagents, then only spawn fix agents for files that actually have high-severity issues. This is useful because it turns a manual "review each file" task into a single bash call that scales to any number of files, uses structured output (ISSUE:severity:line:desc) so results can be filtered with grep, and chains a second round of subagents conditionally based on the first round's results.
+Fan out file reviews to parallel subagents, grep for high-severity issues, conditionally spawn fix agents. Demonstrates structured output, jq prompt building, and chained subagent_batch calls.
 
   ```bash
   VARS="<varsDir>"
@@ -152,7 +152,7 @@ Automatically review every source file for bugs by fanning out to parallel subag
 
   # 4. Conditionally spawn fix agents only if there are issues to fix
   if [[ "$COUNT" -gt 0 ]]; then
-    # Group issues by file path
+    # Group issues by file path (field 3 in ISSUE:high:<file>:<desc>)
     FIX_PROMPTS='[]'
     for f in $(cat "$VARS/high-issues.txt" | sed 's/ISSUE:high://; s/:.*//' | sort -u); do
       ISSUES=$(grep "$f" "$VARS/high-issues.txt")
@@ -174,7 +174,7 @@ Automatically review every source file for bugs by fanning out to parallel subag
 
 ### Example 2: iterative investigation with accumulating context
 
-Track down a runtime error by first using grep to find candidate locations, then llm-subcall (fast, no tools) to triage them, then subagent_batch (full tool access) to deeply investigate each suspect in parallel. This is useful because it chains cheap operations before expensive ones — grep narrows thousands of lines to dozens, llm-subcall narrows dozens to a handful, and only then do full subagents do the heavy lifting. Each step writes to vars/ so context accumulates across bash calls.
+Chain grep → llm-subcall → subagent_batch to narrow down a bug. Each step writes to vars/ so context accumulates. Cheap operations run first, expensive subagents only on filtered suspects.
 
   ```bash
   VARS="<varsDir>"
@@ -204,6 +204,8 @@ Track down a runtime error by first using grep to find candidate locations, then
   # 4. Check which investigations found the root cause
   if grep -q "VERDICT:yes" "$VARS/investigations.txt"; then
     echo "Root cause found. Spawning fix agent..."
+    # Extract the investigation that said yes, pass it as context to a fix agent
+    # Use awk to grab the block containing VERDICT:yes
     EVIDENCE=$(awk '/VERDICT:yes/{found=1} found' "$VARS/investigations.txt" | head -50)
     subagent <<FIXPROMPT
   Based on this investigation:
@@ -219,7 +221,7 @@ Track down a runtime error by first using grep to find candidate locations, then
 
 ### Example 3: recovering lost context from the trajectory
 
-After a compaction, you may not remember details about earlier work — but the trajectory file has every turn verbatim. When the user asks about something you can't find in your current context (e.g. "what did the old parseConfig look like?"), delegate a subagent to search the trajectory and bring back the relevant details. This avoids reading a potentially huge JSON file into your own context — the subagent reads it, extracts what matters, and returns a concise summary.
+After compaction, delegate a subagent to search the trajectory file and return relevant details — avoids loading the full JSON into your own context.
 
   ```bash
   VARS="<varsDir>"
@@ -244,52 +246,19 @@ After a compaction, you may not remember details about earlier work — but the 
   echo "$CONTEXT"
   ```
 
-### Shell compatibility (IMPORTANT)
+### Shell & workflow
 
-The shell is **zsh**, not bash. Write POSIX-compatible or zsh-safe code:
-- Do NOT use `bash -c` or bashisms like `${var//pattern/replace}` — use `sed` instead.
-- Do NOT use `mapfile` or `readarray` — use `while read` loops instead.
-- Do NOT use `local -a` — use `local arr; arr=()` instead.
-- Avoid `match` as a variable name in `awk` — it is a built-in function.
-- Use `[[ ... ]]` for conditionals (works in both bash and zsh).
-- For regex matching, use `grep -E` or `rg` rather than bash regex operators.
-- Quote ALL variable expansions: `"$var"` not `$var`.
-- For process substitution `<(...)`, prefer piping instead: `cmd | while read ...`.
-- For string replacement: `echo "$var" | sed 's/old/new/g'` instead of `${var//old/new}`.
-- Test scripts with `zsh -n script.sh` before running if complex.
-- Use `/tmp/rlm/` for all temp files (pre-authorized, no permission prompts).
-
-### Workflow guidance
-
-- **Always use bash** for file operations, analysis, and coordination.
-- Break complex tasks into subtasks and delegate with subagent or subagent_batch.
-- For independent subtasks, prefer subagent_batch to run them concurrently.
-- For quick LLM queries without tool access, use llm-subcall.
-- Each bash call is a fresh process — variables do not persist between calls.
-  To carry state across calls, write to files in `<varsDir>` and read them back.
-- **IMPORTANT**: For complex prompts with quotes, braces, backslashes, or JSON, ALWAYS use heredoc syntax:
-  ```bash
-  subagent <<'EOF'
-  Your complex prompt with "quotes", {braces}, and $pecial chars here.
-  EOF
-  ```
-  This prevents all shell parsing issues. Only use single-quoted args for short, simple prompts.
-- Pass JSON arguments as single-quoted strings to preserve spaces.
-- Store all temp files under `/tmp/rlm/` — never use `/tmp/` directly (avoids permission prompts).
+The shell is **<detected at runtime from $SHELL>**. Write POSIX-compatible code. Quote all variable expansions.
+Use `/tmp/rlm/` for all temp files (pre-authorized). Each bash call is a fresh process —
+persist state via files in `<varsDir>`. Use heredoc syntax (`<<'EOF'`) for complex prompts.
 
 ### Trajectory and scratch space
 
-Your full conversation trajectory is logged at: `<trajectoryPath>`
-Read this file to recall past work after context compaction. It is append-only — do not write to it.
+- **Trajectory** (read-only): `<trajectoryPath>` — full conversation log, survives compaction.
+- **Scratch dir** (read-write): `<varsDir>` — store plans, notes, intermediates here.
 
-Your persistent scratch directory is: `<varsDir>`
-Use it to store plans, notes, intermediate results, or anything that should survive compaction.
-Prefer structured formats (JSON) so future reads are cheap.
-
-**If you are unsure about a term, function, or file the user references — first check your current
-conversation history (it may still be there), then check the trajectory.**
-After compaction, your context only has a summary. The trajectory has every turn verbatim.
-Use a subagent to search it (see Example 3 above) so you don't load the full file into your own context.
+If you're unsure about something the user references, first check your conversation history,
+then search the trajectory via a subagent (see Example 3) to avoid loading the full file.
 ````
 
 </details>
@@ -331,7 +300,7 @@ SUMMARY=$(llm-subcall "Summarize this error: $(cat /tmp/rlm/errors.log)")
 
 ### Example: parallel review with conditional follow-up
 
-Automatically review every source file for bugs by fanning out to parallel subagents, then only spawn fix agents for files that actually have high-severity issues. This is useful because it turns a manual "review each file" task into a single bash call that scales to any number of files, uses structured output (`ISSUE:severity:line:desc`) so results can be filtered with `grep`, and chains a second round of subagents conditionally based on the first round's results.
+Fan out file reviews to parallel subagents, grep for high-severity issues, conditionally spawn fix agents. Demonstrates structured output, jq prompt building, and chained `subagent_batch` calls.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
@@ -340,69 +309,70 @@ VARS="/tmp/rlm/session-xxx/vars"
 find src -name "*.ts" -not -name "*.test.ts" | head -10 > "$VARS/files.txt"
 PROMPTS='[]'
 while IFS= read -r f; do
-  PROMPTS=$(echo "$PROMPTS" | jq --arg f "$f" \
-    '. + ["Review " + $f + " for bugs. List issues as ISSUE:<severity>:<line>:<description>. If none, output NONE."]')
+  PROMPTS=$(echo "$PROMPTS" | jq --arg f "$f" '. + ["Review " + $f + " for bugs and security issues. List each issue as: ISSUE:<severity>:<line>:<description> (one per line). If no issues, output NONE."]')
 done < "$VARS/files.txt"
 
-# 2. Fan out — all files reviewed concurrently
+# 2. Fan out — all files reviewed concurrently by separate subagents
 subagent_batch "$PROMPTS" > "$VARS/reviews.txt"
 
-# 3. Extract high-severity issues
+# 3. Extract only high-severity issues from all reviews
 grep "ISSUE:high:" "$VARS/reviews.txt" > "$VARS/high-issues.txt" || true
 COUNT=$(wc -l < "$VARS/high-issues.txt" | tr -d ' ')
+echo "Found $COUNT high-severity issues"
 
-# 4. Conditionally spawn fix agents
+# 4. Conditionally spawn fix agents only if there are issues to fix
 if [[ "$COUNT" -gt 0 ]]; then
   FIX_PROMPTS='[]'
-  for f in $(sed 's/ISSUE:high://; s/:.*//' "$VARS/high-issues.txt" | sort -u); do
+  for f in $(cat "$VARS/high-issues.txt" | sed 's/ISSUE:high://; s/:.*//' | sort -u); do
     ISSUES=$(grep "$f" "$VARS/high-issues.txt")
-    FIX_PROMPTS=$(echo "$FIX_PROMPTS" | jq --arg f "$f" --arg i "$ISSUES" \
-      '. + ["Fix these issues in " + $f + ":\n" + $i]')
+    FIX_PROMPTS=$(echo "$FIX_PROMPTS" | jq --arg f "$f" --arg issues "$ISSUES" '. + ["Fix these issues in " + $f + ":\n" + $issues + "\nApply fixes directly with sed -i."]')
   done
   subagent_batch "$FIX_PROMPTS"
 
-  # 5. Verify
+  # 5. Verify fixes compile and tests pass
+  echo "Running tests..."
   if bun test 2>&1 | tail -5; then
-    echo "All tests pass"
+    echo "All tests pass after fixes"
   else
-    echo "Tests failed — review changes"
+    echo "Tests failed — review the changes"
   fi
 else
-  echo "No high-severity issues"
+  echo "No high-severity issues found"
 fi
 ```
 
 ### Example: iterative investigation with accumulating context
 
-Track down a runtime error by first using `grep` to find candidate locations, then `llm-subcall` (fast, no tools) to triage them, then `subagent_batch` (full tool access) to deeply investigate each suspect in parallel. This is useful because it chains cheap operations before expensive ones — `grep` narrows thousands of lines to dozens, `llm-subcall` narrows dozens to a handful, and only then do full subagents do the heavy lifting. Each step writes to `vars/` so context accumulates across bash calls.
+Chain grep → llm-subcall → subagent_batch to narrow down a bug. Each step writes to `vars/` so context accumulates. Cheap operations run first, expensive subagents only on filtered suspects.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
 
-# 1. Find potential error sites
+# 1. Find all entry points that could trigger the error
 grep -rn "getUser" src/ --include="*.ts" | head -30 > "$VARS/refs.txt"
 
-# 2. Use llm-subcall (fast, no tools) to triage
-SUSPECTS=$(llm-subcall --system 'Output ONLY file:line pairs, one per line.' <<'PROMPT'
+# 2. Use llm-subcall (fast, no tools) to triage which refs are worth investigating
+SUSPECTS=$(llm-subcall --system 'Output ONLY file:line pairs, one per line. No explanation.' <<'PROMPT'
 The error is: "TypeError: Cannot read property 'user' of undefined"
-Which of these could cause it?
+Which of these call sites could cause it? (the object before .user is undefined)
 
 $(cat "$VARS/refs.txt")
 PROMPT
 )
 echo "$SUSPECTS" > "$VARS/suspects.txt"
+echo "LLM identified $(wc -l < "$VARS/suspects.txt" | tr -d ' ') suspect locations"
 
-# 3. Fan out deep investigation — each suspect gets a subagent with tool access
+# 3. Fan out deep investigation — each suspect gets a subagent with full tool access
 PROMPTS='[]'
 while IFS= read -r loc; do
   [[ -z "$loc" ]] && continue
-  PROMPTS=$(echo "$PROMPTS" | jq --arg loc "$loc" \
-    '. + ["Investigate " + $loc + " — trace the data flow, read the file, check callers. End with VERDICT:yes or VERDICT:no"]')
+  PROMPTS=$(echo "$PROMPTS" | jq --arg loc "$loc" '. + ["Investigate " + $loc + " — trace the data flow to find where the object could be undefined. Read the file, check callers, and determine if this is the root cause. End your response with VERDICT:yes or VERDICT:no"]')
 done < "$VARS/suspects.txt"
 subagent_batch "$PROMPTS" > "$VARS/investigations.txt"
 
-# 4. If a root cause was found, spawn a fix agent with the evidence
+# 4. Check which investigations found the root cause
 if grep -q "VERDICT:yes" "$VARS/investigations.txt"; then
+  echo "Root cause found. Spawning fix agent..."
   EVIDENCE=$(awk '/VERDICT:yes/{found=1} found' "$VARS/investigations.txt" | head -50)
   subagent <<FIXPROMPT
 Based on this investigation:
@@ -411,13 +381,14 @@ $EVIDENCE
 Apply a fix for the TypeError. Then run the relevant tests to verify.
 FIXPROMPT
 else
-  echo "No root cause found. Results in $VARS/investigations.txt"
+  echo "No conclusive root cause found. All investigations saved to $VARS/investigations.txt"
+  echo "Consider widening the search or investigating manually."
 fi
 ```
 
 ### Example: recovering lost context from the trajectory
 
-After a compaction, you may not remember details about earlier work — but the trajectory file has every turn verbatim. When the user asks about something you can't find in your current context (e.g. "what did the old parseConfig look like?"), delegate a subagent to search the trajectory and bring back the relevant details. This avoids reading a potentially huge JSON file into your own context — the subagent reads it, extracts what matters, and returns a concise summary.
+After compaction, delegate a subagent to search the trajectory file and return relevant details — avoids loading the full JSON into your own context.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
