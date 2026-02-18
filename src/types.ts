@@ -1,3 +1,12 @@
+/** API-reported token usage for an assistant message */
+export interface TurnTokenUsage {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
 /** A single message turn captured in the trajectory */
 export interface TrajectoryTurn {
   turnIndex: number;
@@ -7,6 +16,10 @@ export interface TrajectoryTurn {
   timestamp: string;
   toolName?: string;
   toolArgs?: string;
+  /** Actual API token usage (only present on assistant message turns) */
+  tokens?: TurnTokenUsage;
+  /** Actual API cost (only present on assistant message turns) */
+  cost?: number;
 }
 
 /** A contiguous sequence of turns between compactions */
@@ -44,6 +57,18 @@ export interface TrajectoryDocument {
     totalCompactions: number;
     totalTokensProcessed: number;
     currentActiveTokens: number;
+    /** Cumulative API-reported output tokens across all assistant messages */
+    totalOutputTokens: number;
+    /** Cumulative API-reported reasoning tokens */
+    totalReasoningTokens: number;
+    /** Cumulative API cost */
+    totalCost: number;
+    /** Last assistant message's tokens.input (API-reported current context size) */
+    lastInputTokens: number;
+    /** Snapshot of lastInputTokens when compaction starts (0 = no pending compaction) */
+    pendingCompactionInputTokens: number;
+    /** Cumulative tokens lost to compaction: sum of (pre - post) input deltas */
+    totalCompactedTokens: number;
   };
 }
 

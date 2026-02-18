@@ -263,7 +263,7 @@ then search the trajectory via a subagent (see Example 3) to avoid loading the f
 
 </details>
 
-> **System prompt size:** ~11k characters / ~2,700 tokens (before path interpolation). This is injected into every LLM request via `output.system[]`.
+> **System prompt size:** ~8k characters / ~2k tokens (before path interpolation). This is injected into every LLM request via `output.system[]`.
 
 ## Subagent calls
 

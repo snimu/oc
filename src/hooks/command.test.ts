@@ -52,25 +52,28 @@ function usage(input: number, output = 500, opts?: Partial<TokenUsage>): TokenUs
 // ── Token display (uses OpenCode's actual counts) ────────────────
 
 describe("/context token display", () => {
-  test("shows actual input tokens from last message", async () => {
+  test("shows total tokens (input+output+reasoning+cache) from last message", async () => {
     const state = makeState();
     const output = await buildContextDisplay(state, {
       lastUsage: usage(50000),
       messageCount: 10,
     });
-    expect(output).toContain("50.0k input tokens");
+    // total = 50000 input + 500 output + 0 reasoning + 0 cache = 50500
+    expect(output).toContain("50.5k total tokens");
+    expect(output).toContain("50.0k input");
     expect(output).toContain("10 messages in session");
   });
 
-  test("shows context limit and percentage", async () => {
+  test("shows context limit and percentage based on total", async () => {
     const state = makeState();
     const output = await buildContextDisplay(state, {
       lastUsage: usage(50000),
       contextLimit: 200000,
     });
-    expect(output).toContain("50.0k input tokens");
+    // total = 50500, pct = 50500/200000 = 25.3%
+    expect(output).toContain("50.5k total tokens");
     expect(output).toContain("200k limit");
-    expect(output).toContain("25.0%");
+    expect(output).toContain("25.3%");
   });
 
   test("shows output and reasoning tokens", async () => {
@@ -78,8 +81,9 @@ describe("/context token display", () => {
     const output = await buildContextDisplay(state, {
       lastUsage: usage(10000, 2000, { reasoning: 500 }),
     });
-    expect(output).toContain("10.0k input tokens");
-    expect(output).toContain("2.0k output, 500 reasoning");
+    // total = 10000 + 2000 + 500 = 12500
+    expect(output).toContain("12.5k total tokens");
+    expect(output).toContain("10.0k input, 2.0k output, 500 reasoning");
   });
 
   test("shows cache stats when present", async () => {

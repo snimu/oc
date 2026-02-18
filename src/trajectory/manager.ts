@@ -30,6 +30,12 @@ export function createEmptyDocument(sessionId: string): TrajectoryDocument {
       totalCompactions: 0,
       totalTokensProcessed: 0,
       currentActiveTokens: 0,
+      totalOutputTokens: 0,
+      totalReasoningTokens: 0,
+      totalCost: 0,
+      lastInputTokens: 0,
+      pendingCompactionInputTokens: 0,
+      totalCompactedTokens: 0,
     },
   };
 }
@@ -60,6 +66,28 @@ export function appendTurn(
   doc.stats.totalTurns++;
   doc.stats.totalTokensProcessed += turn.estimatedTokens;
   doc.stats.currentActiveTokens = active.totalEstimatedTokens;
+  // Accumulate actual API usage from assistant turns
+  if (turn.tokens) {
+    doc.stats.totalOutputTokens += turn.tokens.output;
+    doc.stats.totalReasoningTokens += turn.tokens.reasoning;
+
+    // Resolve pending compaction delta:
+    // If a compaction happened since the last assistant turn, the input tokens
+    // dropped. The difference = tokens compacted away from context but still
+    // in the trajectory.
+    if (doc.stats.pendingCompactionInputTokens > 0 && turn.tokens.input > 0) {
+      const delta = doc.stats.pendingCompactionInputTokens - turn.tokens.input;
+      if (delta > 0) {
+        doc.stats.totalCompactedTokens += delta;
+      }
+      doc.stats.pendingCompactionInputTokens = 0;
+    }
+
+    doc.stats.lastInputTokens = turn.tokens.input;
+  }
+  if (turn.cost) {
+    doc.stats.totalCost += turn.cost;
+  }
   doc.lastUpdatedAt = new Date().toISOString();
 }
 
@@ -119,6 +147,9 @@ export function recordCompaction(
 
   doc.stats.totalCompactions++;
   doc.stats.currentActiveTokens = 0;
+  // Snapshot pre-compaction context size so we can compute the delta
+  // when the next assistant turn arrives with a smaller input
+  doc.stats.pendingCompactionInputTokens = doc.stats.lastInputTokens;
   doc.lastUpdatedAt = now;
 }
 

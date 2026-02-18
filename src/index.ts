@@ -998,6 +998,8 @@ export const RLMPlugin: Plugin = async (ctx) => {
         let totalUsage: import("./hooks/command").TokenUsage | undefined;
         let contextLimit: number | undefined;
         let messageCount = 0;
+        let lastModelID: string | undefined;
+        let lastProviderID: string | undefined;
 
         try {
           const resp = await ctx.client.session.messages({
@@ -1006,59 +1008,69 @@ export const RLMPlugin: Plugin = async (ctx) => {
           const msgs = resp.data ?? [];
           messageCount = msgs.length;
 
-          // Grab the last assistant message for current context size,
-          // and sum output/reasoning/cost across all messages (those are per-call).
-          // NOTE: tokens.input is NOT summed — each call's input already includes
-          // the full conversation history, so summing would massively overcount.
-          const totals = { output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-          for (const m of msgs) {
+          // Find the last assistant message for current context snapshot
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
             if (m.info.role === "assistant") {
-              const tokens = (m.info as any).tokens;
-              const cost = (m.info as any).cost ?? 0;
-              if (tokens) {
-                totals.output += tokens.output ?? 0;
-                totals.reasoning += tokens.reasoning ?? 0;
-                totals.cacheRead += tokens.cache?.read ?? 0;
-                totals.cacheWrite += tokens.cache?.write ?? 0;
-                totals.cost += cost;
-
-                // Keep updating — last one wins (= current context size)
+              const a = m.info as any;
+              if (a.tokens?.output > 0) {
                 lastUsage = {
-                  input: tokens.input ?? 0,
-                  output: tokens.output ?? 0,
-                  reasoning: tokens.reasoning ?? 0,
-                  cacheRead: tokens.cache?.read ?? 0,
-                  cacheWrite: tokens.cache?.write ?? 0,
-                  cost,
+                  input: a.tokens.input,
+                  output: a.tokens.output,
+                  reasoning: a.tokens.reasoning,
+                  cacheRead: a.tokens.cache?.read ?? 0,
+                  cacheWrite: a.tokens.cache?.write ?? 0,
+                  cost: a.cost ?? 0,
                 };
+                lastModelID = a.modelID;
+                lastProviderID = a.providerID;
+                break;
               }
             }
-          }
-          if (lastUsage) {
-            totalUsage = {
-              input: lastUsage.input, // Current context size (not summed)
-              output: totals.output,
-              reasoning: totals.reasoning,
-              cacheRead: totals.cacheRead,
-              cacheWrite: totals.cacheWrite,
-              cost: totals.cost,
-            };
           }
         } catch {
           /* best-effort */
         }
 
+        // Session totals from trajectory (survives compaction — append-only)
+        const s = state.document.stats;
+        if (lastUsage || s.totalOutputTokens > 0) {
+          totalUsage = {
+            input: lastUsage?.input ?? 0,
+            output: s.totalOutputTokens,
+            reasoning: s.totalReasoningTokens,
+            cacheRead: 0, // not tracked cumulatively (not meaningful to sum)
+            cacheWrite: 0,
+            cost: s.totalCost,
+          };
+        }
+
         try {
           const providers = await ctx.client.config.providers({});
-          const providerList = (providers.data as any)?.providers ?? [];
-          for (const p of providerList) {
-            for (const m of p.models ?? []) {
-              if (m.limit?.context) {
-                contextLimit = m.limit.context;
+          const providerList = providers.data?.providers ?? [];
+          // Look up the context limit for the model actually in use
+          if (lastProviderID && lastModelID) {
+            for (const p of providerList) {
+              if (p.id === lastProviderID) {
+                const model = p.models?.[lastModelID];
+                if (model?.limit?.context) {
+                  contextLimit = model.limit.context;
+                }
                 break;
               }
             }
-            if (contextLimit) break;
+          }
+          // Fallback: use the first model with a context limit
+          if (!contextLimit) {
+            for (const p of providerList) {
+              for (const model of Object.values(p.models ?? {})) {
+                if (model.limit?.context) {
+                  contextLimit = model.limit.context;
+                  break;
+                }
+              }
+              if (contextLimit) break;
+            }
           }
         } catch {
           /* best-effort */
@@ -1086,7 +1098,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
       if (!input.sessionID) return;
       const state = sessionStates.get(input.sessionID);
       if (!state) return;
-      // System prompt: ~11k chars / ~2,700 tokens (before path interpolation)
+      // System prompt: ~8k chars / ~2k tokens (before path interpolation)
       output.system.push(
         [
           `## RLM (Recursive Language Model) scaffold`,

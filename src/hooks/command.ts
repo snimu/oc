@@ -103,15 +103,18 @@ export async function buildContextDisplay(
   L.push("");
 
   // ── Current context (from OpenCode's actual token counts) ──
+  // Total context = input + output + reasoning + cache.read + cache.write
+  // (matches OpenCode's built-in context display)
   L.push("Current Context");
   if (opts.lastUsage) {
     const u = opts.lastUsage;
-    let line = `${fmt(u.input)} input tokens`;
+    const total = u.input + u.output + u.reasoning + u.cacheRead + u.cacheWrite;
+    let line = `${fmt(total)} total tokens`;
     if (opts.contextLimit) {
-      line += ` / ${fmt(opts.contextLimit)} limit (${pct(u.input, opts.contextLimit)})`;
+      line += ` / ${fmt(opts.contextLimit)} limit (${pct(total, opts.contextLimit)})`;
     }
     L.push(indent(line));
-    L.push(indent(`${fmt(u.output)} output, ${fmt(u.reasoning)} reasoning`));
+    L.push(indent(`${fmt(u.input)} input, ${fmt(u.output)} output, ${fmt(u.reasoning)} reasoning`));
     if (u.cacheRead > 0 || u.cacheWrite > 0) {
       L.push(indent(`cache: ${fmt(u.cacheRead)} read, ${fmt(u.cacheWrite)} write`));
     }
@@ -164,6 +167,12 @@ export async function buildContextDisplay(
   L.push("Trajectory");
   L.push(indent(`file: ${state.trajectoryPath}`));
   L.push(indent(`${doc.entries.length} entries, ${doc.stats.totalTurns} turns, ${doc.stats.totalCompactions} compactions`));
+  // trajectory_tokens = current context + tokens compacted away
+  // (uses actual API-reported input tokens, not character estimates)
+  const trajectoryTokens = doc.stats.lastInputTokens + doc.stats.totalCompactedTokens;
+  if (trajectoryTokens > 0) {
+    L.push(indent(`~${fmt(trajectoryTokens)} tokens stored (context + compacted history)`));
+  }
   const allTurns: Array<{ role: string; content: string; timestamp: string }> = [];
   for (const entry of doc.entries) {
     if (entry.type === "segment") {

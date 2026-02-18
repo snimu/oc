@@ -46,6 +46,11 @@ export async function handleSessionIdle(
       continue;
     }
 
+    // Extract actual API token usage from assistant messages (once per message)
+    let msgTokensCaptured = false;
+    const isAssistant = role === "assistant";
+    const assistantInfo = isAssistant ? (msg.info as any) : null;
+
     for (const part of msg.parts) {
       if (part.type === "text") {
         const content = (part as any).text ?? "";
@@ -57,6 +62,18 @@ export async function handleSessionIdle(
           content,
 
         );
+        // Attach actual API token usage to the first text turn of assistant messages
+        if (isAssistant && !msgTokensCaptured && assistantInfo?.tokens) {
+          turn.tokens = {
+            input: assistantInfo.tokens.input ?? 0,
+            output: assistantInfo.tokens.output ?? 0,
+            reasoning: assistantInfo.tokens.reasoning ?? 0,
+            cacheRead: assistantInfo.tokens.cache?.read ?? 0,
+            cacheWrite: assistantInfo.tokens.cache?.write ?? 0,
+          };
+          turn.cost = assistantInfo.cost ?? 0;
+          msgTokensCaptured = true;
+        }
         appendTurn(state.document, turn);
       } else if (part.type === "tool") {
         const toolPart = part as any;
