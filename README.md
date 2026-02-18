@@ -130,7 +130,7 @@ Do NOT write to `active/` — it is managed by the scaffold. Use `vars/` instead
 
 ### Example 1: parallel review with conditional follow-up
 
-Scan source files, fan out reviews in parallel, then only fix files that have issues:
+Automatically review every source file for bugs by fanning out to parallel subagents, then only spawn fix agents for files that actually have high-severity issues. This is useful because it turns a manual "review each file" task into a single bash call that scales to any number of files, uses structured output (ISSUE:severity:line:desc) so results can be filtered with grep, and chains a second round of subagents conditionally based on the first round's results.
 
   ```bash
   VARS="<varsDir>"
@@ -174,7 +174,7 @@ Scan source files, fan out reviews in parallel, then only fix files that have is
 
 ### Example 2: iterative investigation with accumulating context
 
-Trace a bug through the call stack — each step informs the next, narrowing down the root cause:
+Track down a runtime error by first using grep to find candidate locations, then llm-subcall (fast, no tools) to triage them, then subagent_batch (full tool access) to deeply investigate each suspect in parallel. This is useful because it chains cheap operations before expensive ones — grep narrows thousands of lines to dozens, llm-subcall narrows dozens to a handful, and only then do full subagents do the heavy lifting. Each step writes to vars/ so context accumulates across bash calls.
 
   ```bash
   VARS="<varsDir>"
@@ -217,10 +217,32 @@ Trace a bug through the call stack — each step informs the next, narrowing dow
   fi
   ```
 
-**Key patterns**: bash gives you programmatic control flow (if/else, loops, conditionals),
-data pipelines (jq, grep, awk to filter/transform between steps), fan-out-then-converge
-(subagent_batch for parallel work, then aggregate and decide), mixed tools (llm-subcall
-for fast triage, subagent for deep work), and persistent state (vars/ survives across bash calls).
+### Example 3: recovering lost context from the trajectory
+
+After a compaction, you may not remember details about earlier work — but the trajectory file has every turn verbatim. When the user asks about something you can't find in your current context (e.g. "what did the old parseConfig look like?"), delegate a subagent to search the trajectory and bring back the relevant details. This avoids reading a potentially huge JSON file into your own context — the subagent reads it, extracts what matters, and returns a concise summary.
+
+  ```bash
+  VARS="<varsDir>"
+  TRAJECTORY="<trajectoryPath>"
+
+  # Delegate trajectory search to a subagent — it reads the full file so you don't have to
+  CONTEXT=$(subagent <<SEARCH
+  Read the trajectory file at $TRAJECTORY and find all discussion about the "parseConfig" function.
+  Extract:
+  1. The original implementation (any code blocks or file contents shown)
+  2. What changes were made and why
+  3. The final state of the function
+
+  Search with: jq -r '.entries[].turns[]? | select(.content | test("parseConfig"; "i")) | "\(.role) [turn \(.turnIndex)]:\n\(.content[:500])"' $TRAJECTORY
+
+  Return a concise summary with the key code snippets.
+  SEARCH
+  )
+
+  # Save for reference and use in your response
+  echo "$CONTEXT" > "$VARS/parseConfig-history.txt"
+  echo "$CONTEXT"
+  ```
 
 ### Shell compatibility (IMPORTANT)
 
@@ -264,12 +286,15 @@ Your persistent scratch directory is: `<varsDir>`
 Use it to store plans, notes, intermediate results, or anything that should survive compaction.
 Prefer structured formats (JSON) so future reads are cheap.
 
-**If you are unsure about a term, function, or file the user references — check the trajectory.**
-After compaction, your context only has a summary. The trajectory has every turn verbatim:
-`grep -i "parseConfig" <trajectoryPath>` or use jq to search turn content.
+**If you are unsure about a term, function, or file the user references — first check your current
+conversation history (it may still be there), then check the trajectory.**
+After compaction, your context only has a summary. The trajectory has every turn verbatim.
+Use a subagent to search it (see Example 3 above) so you don't load the full file into your own context.
 ````
 
 </details>
+
+> **System prompt size:** ~11k characters / ~2,700 tokens (before path interpolation). This is injected into every LLM request via `output.system[]`.
 
 ## Subagent calls
 
@@ -306,7 +331,7 @@ SUMMARY=$(llm-subcall "Summarize this error: $(cat /tmp/rlm/errors.log)")
 
 ### Example: parallel review with conditional follow-up
 
-This example demonstrates how the LM can use **programmatic control flow** to orchestrate a multi-phase workflow. It starts by discovering source files and dynamically building a JSON array of review prompts using a `while read` loop and `jq`. Then it fans out all reviews concurrently via `subagent_batch` — each file gets its own child session with full tool access, running in parallel. The structured output format (`ISSUE:high:file:description`) lets the script use `grep` to filter results programmatically, and an `if/else` conditional decides whether to spawn a second round of fix agents. The fix prompts are themselves built dynamically by iterating over the grouped issues. Finally, the script verifies the fixes by running the test suite — closing the loop with automated validation.
+Automatically review every source file for bugs by fanning out to parallel subagents, then only spawn fix agents for files that actually have high-severity issues. This is useful because it turns a manual "review each file" task into a single bash call that scales to any number of files, uses structured output (`ISSUE:severity:line:desc`) so results can be filtered with `grep`, and chains a second round of subagents conditionally based on the first round's results.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
@@ -349,7 +374,7 @@ fi
 
 ### Example: iterative investigation with accumulating context
 
-This example shows how different tool tiers can be **chained together in a pipeline**, with each step narrowing the search space for the next. It starts with a broad `grep` to find candidate locations, then uses `llm-subcall` (a fast, tool-less LLM call) to triage the candidates — this is cheap and quick because it doesn't need to read files or run tools. The triage results are written to `vars/` so they persist across bash calls. The filtered suspects are then fanned out to full `subagent` sessions (with tool access) for deep investigation — each subagent can read files, trace call chains, and check callers. The structured `VERDICT:yes/no` output lets the script use `grep` to determine if any investigation was conclusive, and conditionally spawn a final fix agent that receives the accumulated evidence as context.
+Track down a runtime error by first using `grep` to find candidate locations, then `llm-subcall` (fast, no tools) to triage them, then `subagent_batch` (full tool access) to deeply investigate each suspect in parallel. This is useful because it chains cheap operations before expensive ones — `grep` narrows thousands of lines to dozens, `llm-subcall` narrows dozens to a handful, and only then do full subagents do the heavy lifting. Each step writes to `vars/` so context accumulates across bash calls.
 
 ```bash
 VARS="/tmp/rlm/session-xxx/vars"
@@ -388,6 +413,33 @@ FIXPROMPT
 else
   echo "No root cause found. Results in $VARS/investigations.txt"
 fi
+```
+
+### Example: recovering lost context from the trajectory
+
+After a compaction, you may not remember details about earlier work — but the trajectory file has every turn verbatim. When the user asks about something you can't find in your current context (e.g. "what did the old parseConfig look like?"), delegate a subagent to search the trajectory and bring back the relevant details. This avoids reading a potentially huge JSON file into your own context — the subagent reads it, extracts what matters, and returns a concise summary.
+
+```bash
+VARS="/tmp/rlm/session-xxx/vars"
+TRAJECTORY="/tmp/rlm/session-xxx/active/trajectory.json"
+
+# Delegate trajectory search to a subagent — it reads the full file so you don't have to
+CONTEXT=$(subagent <<SEARCH
+Read the trajectory file at $TRAJECTORY and find all discussion about the "parseConfig" function.
+Extract:
+1. The original implementation (any code blocks or file contents shown)
+2. What changes were made and why
+3. The final state of the function
+
+Search with: jq -r '.entries[].turns[]? | select(.content | test("parseConfig"; "i")) | "\(.role) [turn \(.turnIndex)]:\n\(.content[:500])"' $TRAJECTORY
+
+Return a concise summary with the key code snippets.
+SEARCH
+)
+
+# Save for reference and use in your response
+echo "$CONTEXT" > "$VARS/parseConfig-history.txt"
+echo "$CONTEXT"
 ```
 
 ## Sub-LM calls
