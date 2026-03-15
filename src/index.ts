@@ -19,6 +19,7 @@ import {
   example2Bash,
   example3Bash,
 } from "./system-prompt-examples";
+import { runSubAgent } from "./sub-agent";
 
 const llmContextPath = "/tmp/rlm/llm-context.json";
 
@@ -83,6 +84,11 @@ list_tools() {
 #   EOF
 #   echo "prompt" | subagent     — prompt via pipe
 subagent() {
+  local max_depth=\${RLM_MAX_DEPTH:-3}
+  if [[ \${OPENCODE_RLM_DEPTH:-0} -ge $max_depth ]]; then
+    echo "Maximum recursion depth ($max_depth) reached. Use llm-subcall instead." >&2
+    return 1
+  fi
   local prompt="\${1:-}"
   if [[ -z "$prompt" && ! -t 0 ]]; then
     prompt=\$(cat)
@@ -368,6 +374,7 @@ async function startProxyServer(
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
+    idleTimeout: 255, // seconds; subagent calls can take minutes
     async fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
@@ -400,6 +407,45 @@ async function startProxyServer(
         if (req.method === "POST" && path === "/session/run") {
           const body = await req.json();
           const { parentID, prompt } = body;
+
+          // --- Verifiers mode: custom tool-calling loop ---
+          if (process.env.RLM_SUBAGENT_VIA_TOOL_LOOP) {
+            const rlmDir = process.env.RLM_BASE_DIR || "/tmp/rlm";
+            const fPath = join(rlmDir, "functions.sh");
+            const mOutput = parseInt(process.env.OPENCODE_RLM_MAX_OUTPUT ?? "8192", 10);
+            const encoder = new TextEncoder();
+            const stream = new ReadableStream({
+              async start(controller) {
+                const send = (obj: any) => {
+                  try {
+                    controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+                  } catch { /* stream closed */ }
+                };
+                try {
+                  const result = await runSubAgent({
+                    prompt,
+                    model: process.env.RLM_SUB_MODEL_ID || "sub",
+                    baseUrl: process.env.OPENAI_BASE_URL!,
+                    apiKey: process.env.OPENAI_API_KEY || "intercepted",
+                    maxTurns: parseInt(process.env.RLM_SUB_MAX_TURNS || "10", 10),
+                    timeoutMs: parseInt(process.env.RLM_SUB_TIMEOUT || "120000", 10),
+                    functionsPath: fPath,
+                    depth: parseInt(process.env.OPENCODE_RLM_DEPTH || "0", 10),
+                    maxOutputChars: mOutput,
+                    onProgress: (text) => send({ type: "progress", text }),
+                  });
+                  send({ type: "result", text: result.content });
+                } catch (e: any) {
+                  send({ type: "error", text: e.message ?? String(e) });
+                }
+                controller.close();
+              },
+            });
+            return new Response(stream, {
+              headers: { "content-type": "application/x-ndjson" },
+            });
+          }
+          // --- End verifiers mode ---
 
           // Stream response
           const encoder = new TextEncoder();
@@ -567,6 +613,58 @@ async function startProxyServer(
           if (!prompts || !Array.isArray(prompts) || prompts.length === 0) {
             return Response.json({ error: "prompts must be a non-empty array" }, { status: 400 });
           }
+
+          // --- Verifiers mode: parallel custom tool-calling loops ---
+          if (process.env.RLM_SUBAGENT_VIA_TOOL_LOOP) {
+            const rlmDir = process.env.RLM_BASE_DIR || "/tmp/rlm";
+            const fPath = join(rlmDir, "functions.sh");
+            const mOutput = parseInt(process.env.OPENCODE_RLM_MAX_OUTPUT ?? "8192", 10);
+            const encoder = new TextEncoder();
+            const stream = new ReadableStream({
+              async start(controller) {
+                const send = (obj: any) => {
+                  try {
+                    controller.enqueue(encoder.encode(JSON.stringify(obj) + "\n"));
+                  } catch { /* stream closed */ }
+                };
+
+                const total = prompts.length;
+                send({ type: "progress", agent: -1, text: `Started ${total} sub-agents` });
+
+                const results = await Promise.all(
+                  prompts.map(async (p: string, i: number) => {
+                    try {
+                      const result = await runSubAgent({
+                        prompt: p,
+                        model: process.env.RLM_SUB_MODEL_ID || "sub",
+                        baseUrl: process.env.OPENAI_BASE_URL!,
+                        apiKey: process.env.OPENAI_API_KEY || "intercepted",
+                        maxTurns: parseInt(process.env.RLM_SUB_MAX_TURNS || "10", 10),
+                        timeoutMs: parseInt(process.env.RLM_SUB_TIMEOUT || "120000", 10),
+                        functionsPath: fPath,
+                        depth: parseInt(process.env.OPENCODE_RLM_DEPTH || "0", 10),
+                        maxOutputChars: mOutput,
+                        onProgress: (text) => send({ type: "progress", agent: i, text }),
+                      });
+                      send({ type: "result", agent: i, text: result.content });
+                      return result.content;
+                    } catch (e: any) {
+                      send({ type: "error", agent: i, text: e.message ?? String(e) });
+                      return "";
+                    }
+                  }),
+                );
+
+                const succeeded = results.filter((r) => r).length;
+                send({ type: "done", succeeded, total });
+                controller.close();
+              },
+            });
+            return new Response(stream, {
+              headers: { "content-type": "application/x-ndjson" },
+            });
+          }
+          // --- End verifiers mode ---
 
           const encoder = new TextEncoder();
           const stream = new ReadableStream({
@@ -1224,6 +1322,17 @@ export const RLMPlugin: Plugin = async (ctx) => {
       output.env.OPENCODE_RLM_URL = proxyUrl;
       output.env.OPENCODE_RLM_DIR_PATH = directory;
       output.env.OPENCODE_AUTH_HEADER = authHeader;
+      // Forward verifiers integration env vars to bash processes
+      for (const key of [
+        "RLM_LLM_SUBCALL_VIA_PROXY",
+        "RLM_SUBAGENT_VIA_TOOL_LOOP",
+        "RLM_SUB_MODEL_ID",
+        "RLM_SUB_MAX_TURNS",
+        "RLM_SUB_TIMEOUT",
+        "RLM_MAX_DEPTH",
+      ]) {
+        if (process.env[key]) output.env[key] = process.env[key];
+      }
     },
 
     "tool.execute.before": async (input, output) => {
