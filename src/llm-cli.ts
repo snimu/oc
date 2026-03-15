@@ -36,6 +36,53 @@ if (!prompt) {
   process.exit(1);
 }
 
+// --- Proxy mode: route through OPENAI_BASE_URL for verifiers integration ---
+if (process.env.RLM_LLM_SUBCALL_VIA_PROXY) {
+  const baseUrl = process.env.OPENAI_BASE_URL;
+  const modelId = process.env.RLM_SUB_MODEL_ID || "sub";
+  const apiKey = process.env.OPENAI_API_KEY || "intercepted";
+
+  if (!baseUrl) {
+    process.stderr.write(
+      "Error: proxy mode (RLM_LLM_SUBCALL_VIA_PROXY) requires OPENAI_BASE_URL\n",
+    );
+    process.exit(1);
+  }
+
+  const messages: Array<{ role: string; content: string }> = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
+
+  try {
+    const resp = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model: modelId, messages }),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      process.stderr.write(`LLM API error (${resp.status}): ${text}\n`);
+      process.exit(1);
+    }
+
+    const data = (await resp.json()) as {
+      choices: Array<{ message: { content: string } }>;
+    };
+    const result =
+      data.choices?.[0]?.message?.content || "(empty response)";
+    process.stdout.write(result);
+  } catch (err: any) {
+    process.stderr.write(`LLM proxy call failed: ${err.message}\n`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+// --- End proxy mode ---
+
 const contextPath = process.env.RLM_LLM_CONTEXT;
 if (!contextPath) {
   process.stderr.write(
