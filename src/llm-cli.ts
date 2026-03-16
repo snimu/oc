@@ -36,18 +36,12 @@ if (!prompt) {
   process.exit(1);
 }
 
-// --- Proxy mode: route through OPENAI_BASE_URL for verifiers integration ---
-if (process.env.RLM_LLM_SUBCALL_VIA_PROXY) {
+// --- Route through OPENAI_BASE_URL when available (works for both
+//     standalone and verifiers mode). Falls back to llm-context.json below. ---
+if (process.env.OPENAI_BASE_URL) {
   const baseUrl = process.env.OPENAI_BASE_URL;
-  const modelId = process.env.RLM_SUB_MODEL_ID || "sub";
+  const modelId = process.env.OPENAI_MODEL || "default";
   const apiKey = process.env.OPENAI_API_KEY || "intercepted";
-
-  if (!baseUrl) {
-    process.stderr.write(
-      "Error: proxy mode (RLM_LLM_SUBCALL_VIA_PROXY) requires OPENAI_BASE_URL\n",
-    );
-    process.exit(1);
-  }
 
   const messages: Array<{ role: string; content: string }> = [];
   if (system) messages.push({ role: "system", content: system });
@@ -59,6 +53,7 @@ if (process.env.RLM_LLM_SUBCALL_VIA_PROXY) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
+        "X-RLM-Role": "sub",
       },
       body: JSON.stringify({ model: modelId, messages }),
     });
@@ -81,7 +76,7 @@ if (process.env.RLM_LLM_SUBCALL_VIA_PROXY) {
   }
   process.exit(0);
 }
-// --- End proxy mode ---
+// --- End OPENAI_BASE_URL path ---
 
 const contextPath = process.env.RLM_LLM_CONTEXT;
 if (!contextPath) {

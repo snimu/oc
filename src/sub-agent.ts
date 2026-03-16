@@ -69,13 +69,16 @@ export async function runSubAgent(options: SubAgentOptions): Promise<SubAgentRes
 
   let totalToolCalls = 0;
 
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+    "X-RLM-Role": "sub",
+  };
+
   for (let turn = 0; turn < maxTurns; turn++) {
     const resp = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
+      headers,
       body: JSON.stringify({ model, messages, tools: [BASH_TOOL_DEF] }),
     });
 
@@ -140,10 +143,7 @@ export async function runSubAgent(options: SubAgentOptions): Promise<SubAgentRes
 
   const finalResp = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers,
     body: JSON.stringify({ model, messages }),
   });
 

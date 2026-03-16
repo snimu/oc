@@ -424,7 +424,7 @@ async function startProxyServer(
                 try {
                   const result = await runSubAgent({
                     prompt,
-                    model: process.env.RLM_SUB_MODEL_ID || "sub",
+                    model: process.env.OPENAI_MODEL || "default",
                     baseUrl: process.env.OPENAI_BASE_URL!,
                     apiKey: process.env.OPENAI_API_KEY || "intercepted",
                     maxTurns: parseInt(process.env.RLM_SUB_MAX_TURNS || "10", 10),
@@ -636,7 +636,7 @@ async function startProxyServer(
                     try {
                       const result = await runSubAgent({
                         prompt: p,
-                        model: process.env.RLM_SUB_MODEL_ID || "sub",
+                        model: process.env.OPENAI_MODEL || "default",
                         baseUrl: process.env.OPENAI_BASE_URL!,
                         apiKey: process.env.OPENAI_API_KEY || "intercepted",
                         maxTurns: parseInt(process.env.RLM_SUB_MAX_TURNS || "10", 10),
@@ -1324,9 +1324,7 @@ export const RLMPlugin: Plugin = async (ctx) => {
       output.env.OPENCODE_AUTH_HEADER = authHeader;
       // Forward verifiers integration env vars to bash processes
       for (const key of [
-        "RLM_LLM_SUBCALL_VIA_PROXY",
         "RLM_SUBAGENT_VIA_TOOL_LOOP",
-        "RLM_SUB_MODEL_ID",
         "RLM_SUB_MAX_TURNS",
         "RLM_SUB_TIMEOUT",
         "RLM_MAX_DEPTH",
